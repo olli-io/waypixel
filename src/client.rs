@@ -8,9 +8,20 @@ use crate::ipc;
 
 /// Returns the exit code: 0 = ok, 1 = error, 3 = the daemon is not running.
 pub fn request(args: &[&str]) -> i32 {
+    match fetch(args) {
+        Ok(body) => {
+            print!("{body}");
+            0
+        }
+        Err(code) => code,
+    }
+}
+
+/// Returns the reply body. On an error, prints the text and returns the exit code.
+pub fn fetch(args: &[&str]) -> Result<String, i32> {
     let Ok(mut stream) = UnixStream::connect(ipc::socket_path()) else {
         eprintln!("pixelwp: the daemon is not running");
-        return 3;
+        return Err(3);
     };
     let mut reply = String::new();
     let io = stream
@@ -19,17 +30,16 @@ pub fn request(args: &[&str]) -> i32 {
         .and_then(|()| stream.read_to_string(&mut reply));
     if let Err(e) = io {
         eprintln!("pixelwp: {e}");
-        return 1;
+        return Err(1);
     }
     let (status, body) = reply.split_once('\n').unwrap_or((&reply, ""));
     if status == "ok" {
-        print!("{body}");
-        0
+        Ok(body.to_owned())
     } else {
         let text = status
             .strip_prefix("error ")
             .unwrap_or("bad reply from the daemon");
         eprintln!("pixelwp: {text}");
-        1
+        Err(1)
     }
 }

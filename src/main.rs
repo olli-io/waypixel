@@ -11,6 +11,7 @@ mod fx;
 mod ipc;
 mod pixelart;
 mod scale;
+mod still;
 
 use std::process::ExitCode;
 
@@ -22,6 +23,8 @@ Usage:
   pixelwp clear [--color <hex>] [--output ...] [--fx ...]
                                                  solid colour (default: 000000)
   pixelwp query                                  one line for each output
+  pixelwp still <file.png> [--output <name>]     write the wallpaper of one output as a PNG
+                                                 (default: the largest output)
   pixelwp pause | resume                         manual pause
   pixelwp kill                                   stop the daemon
 
@@ -44,6 +47,10 @@ enum Cmd {
         fx: String,
     },
     Query,
+    Still {
+        path: String,
+        output: Option<String>,
+    },
     Pause,
     Resume,
     Kill,
@@ -142,6 +149,16 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
                 output: p.output.unwrap_or_else(|| "all".into()),
             })
         }
+        "still" => {
+            let p = parse_options(rest, &["--output"])?;
+            let [path] = p.positional.as_slice() else {
+                return Err("still needs one path".into());
+            };
+            Ok(Cmd::Still {
+                path: path.clone(),
+                output: p.output,
+            })
+        }
         "clear" => {
             let p = parse_options(rest, &["--output", "--color", "--fx"])?;
             if !p.positional.is_empty() {
@@ -211,6 +228,7 @@ fn main() -> ExitCode {
         }
         Cmd::Clear { color, output, fx } => client::request(&["clear", &color, &output, &fx]),
         Cmd::Query => client::request(&["query"]),
+        Cmd::Still { path, output } => still::run(path.as_ref(), output.as_deref()),
         Cmd::Pause => client::request(&["pause"]),
         Cmd::Resume => client::request(&["resume"]),
         Cmd::Kill => client::request(&["kill"]),
@@ -261,6 +279,14 @@ mod tests {
             clear("ff8800", "DP-2")
         );
 
+        assert_eq!(
+            p(&["still", "a.png", "-o", "DP-1"]),
+            Ok(Cmd::Still {
+                path: "a.png".into(),
+                output: Some("DP-1".into()),
+            })
+        );
+        assert!(p(&["still"]).is_err());
         assert!(p(&[]).is_err());
         assert!(p(&["img"]).is_err());
         assert!(p(&["img", "a", "b"]).is_err());

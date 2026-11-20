@@ -33,6 +33,8 @@ pixelwp img "$(fzf)"                      # select a file with a shell tool
 pixelwp clear --color 202020              # solid colour (default 000000)
 pixelwp img forest.gif --fx wipe          # transition for this change only
 pixelwp query                             # <name> <w>x<h> <file|color #RRGGBB> <state>
+pixelwp still ~/lock.png                  # first frame of the largest output, as a PNG
+pixelwp still ~/lock.png --output DP-1    # first frame of one output
 pixelwp pause
 pixelwp resume
 pixelwp kill
@@ -70,6 +72,20 @@ The daemon keeps the last wallpaper of each output in
 `$XDG_STATE_HOME/pixelwp/state` and shows it again at the next start. Decoded
 images are in `$XDG_CACHE_HOME/pixelwp/`. The daemon deletes the cache files
 that no output uses.
+
+## Lock screen
+
+A session lock hides the wallpaper, and lock screens such as hyprlock do not
+play a GIF. `pixelwp still` writes the first frame as a PNG, with the same
+integer scale as the wallpaper. Run it after each `pixelwp img`, and give the
+file to the lock screen:
+
+```
+# hyprlock.conf
+background {
+    path = ~/lock.png
+}
+```
 
 ## Start at login
 

@@ -59,6 +59,7 @@ file ─(child: image crate)─▶ pixel-art detect ─▶ 1× frames ─▶ til
 | `pixelwp img <path> [--output <name\|all>] [--fx <name>]` | Set the wallpaper. Default `all`. `--fx`: see §9a. |
 | `pixelwp clear [--color <hex>] [--output ...] [--fx ...]` | Solid colour. Default `000000`. |
 | `pixelwp query` | One line per output: `<name> <w>x<h> <file\|color #RRGGBB> <state>` |
+| `pixelwp still <file.png> [--output <name>]` | Write frame 0 of one output as a PNG. Default: the largest output. The client does this: it reads `query` and the cache file. Pixel art has the output size and the integer scale; other images have the stored size; a colour is 1×1. |
 | `pixelwp pause` / `resume` | Manual pause. |
 | `pixelwp kill` | Stop the daemon. |
 
