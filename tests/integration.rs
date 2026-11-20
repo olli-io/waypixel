@@ -636,6 +636,7 @@ impl Env {
         cmd.env("XDG_RUNTIME_DIR", self.dir.join("rt"))
             .env("XDG_CACHE_HOME", self.dir.join("cache"))
             .env("XDG_STATE_HOME", self.dir.join("state"))
+            .env("XDG_CONFIG_HOME", self.dir.join("config"))
             .env("WAYLAND_DISPLAY", "wayland-test")
             .env_remove("WAYLAND_SOCKET");
         cmd
@@ -653,9 +654,17 @@ impl Env {
 
     /// Runs a client command. Returns (exit code, stdout, stderr).
     fn cli(&self, args: &[&str]) -> (i32, String, String) {
+        // Without `--fx`, a test gets no transition: the reply comes with the final pixels.
+        let set = matches!(args.first(), Some(&"img" | &"clear"));
+        let no_fx: &[&str] = if set && !args.contains(&"--fx") && args.len() > 1 {
+            &["--fx", "disabled"]
+        } else {
+            &[]
+        };
         let out = self
             .command()
             .args(args)
+            .args(no_fx)
             .stdin(Stdio::null())
             .output()
             .unwrap();
@@ -1212,5 +1221,116 @@ fn targets_4k() {
     assert!(cpu < 0.5, "CPU {cpu} %");
     assert!(rss < 45 * 1024, "animation RSS {rss} kB");
     assert_eq!(env.mock().live_buffers, 1);
+    env.assert_no_errors();
+}
+
+/// A burn transition: the texture goes from the old wallpaper, through a mix of
+/// the two, to the new wallpaper. Then the animation plays.
+#[test]
+fn burn_transition() {
+    let outputs = vec![
+        OutputCfg {
+            name: "DP-1",
+            logical: (1280, 720),
+            scale120: 120,
+        },
+        OutputCfg {
+            name: "HDMI-A-1",
+            logical: (256, 144),
+            scale120: 180,
+        },
+    ];
+    let mut env = Env::new("burn", outputs);
+    env.start_daemon();
+    let phys = [(1280usize, 720usize), (384, 216)];
+    let old = 0xFF01_0203;
+    env.ok(&["clear", "--color", "010203"]);
+
+    let (w, h) = (64, 36);
+    let frames = art_frames(w, h, 3, 9);
+    let gif = env.dir.join("anim.gif");
+    write_gif(&gif, &frames, w, h, 4, 50);
+    let start = Instant::now();
+    // the transition comes from the config file
+    std::fs::create_dir_all(env.dir.join("config/pixelwp")).unwrap();
+    std::fs::write(
+        env.dir.join("config/pixelwp/config"),
+        "transition = slide\n",
+    )
+    .unwrap();
+    let status = env.command().args(["img", gif.to_str().unwrap()]).status();
+    assert!(status.unwrap().success());
+    // the reply comes with the first step: the old wallpaper at the screen size
+    assert!(env.ok(&["query"]).ends_with("anim.gif playing\n"));
+    let refs: Vec<Vec<Vec<u32>>> = phys
+        .iter()
+        .map(|p| frames.iter().map(|f| reference(f, (w, h), *p)).collect())
+        .collect();
+    let mut mixed = [false; 2];
+    let mut done = [false; 2];
+    while !(done[0] && done[1]) {
+        assert!(start.elapsed() < Duration::from_secs(20), "no end");
+        for o in 0..2 {
+            let (texture, size) = env.texture(o);
+            assert_eq!(size, phys[o]);
+            if refs[o].contains(&texture) {
+                done[o] = true;
+                continue;
+            }
+            // only the animation changes the texture after the transition
+            assert!(!done[o], "output {o}: bad texture after the transition");
+            let n = texture.len();
+            let count = |f: &dyn Fn(usize) -> bool| (0..n).filter(|i| f(*i)).count();
+            let old_px = count(&|i| texture[i] == old);
+            let new_px = count(&|i| texture[i] == refs[o][0][i]);
+            assert!(old_px + new_px > n / 2, "output {o}: {old_px} + {new_px}");
+            mixed[o] |= old_px > n / 10 && new_px > n / 10;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    assert_eq!(mixed, [true; 2]);
+    let secs = start.elapsed().as_secs_f64();
+    assert!((2.0..6.0).contains(&secs), "the transition took {secs} s");
+    let mut seen = [false; 3];
+    wait("all frames after the transition", || {
+        seen[shown_frame(&env, 0, &refs[0])] = true;
+        seen.iter().all(|s| *s)
+    });
+
+    // to a colour, on one output: the result is the 1×1 buffer
+    env.ok(&[
+        "clear", "--color", "405060", "-o", "HDMI-A-1", "--fx", "burn",
+    ]);
+    assert_eq!(env.texture(1).1, phys[1]);
+    wait("colour after the transition", || {
+        env.texture(1) == (vec![0xFF40_5060], (1, 1))
+    });
+    shown_frame(&env, 0, &refs[0]);
+
+    // `disabled` in the config file: the reply comes with the final pixels
+    std::fs::write(
+        env.dir.join("config/pixelwp/config"),
+        "transition = disabled\n",
+    )
+    .unwrap();
+    let args = ["clear", "--color", "112233", "-o", "HDMI-A-1"];
+    assert!(env.command().args(args).status().unwrap().success());
+    assert_eq!(env.texture(1), (vec![0xFF11_2233], (1, 1)));
+    for fx in ["sweep", "wipe"] {
+        env.ok(&["clear", "--color", "405060", "-o", "HDMI-A-1", "--fx", fx]);
+        assert_eq!(env.texture(1).1, phys[1]);
+        env.ok(&["clear", "--color", "112233", "-o", "HDMI-A-1"]);
+    }
+    let (code, _, _) = env.cli(&["clear", "--fx", "melt"]);
+    assert_eq!(code, 2);
+    env.ok(&["clear", "--color", "405060", "-o", "HDMI-A-1"]);
+    assert_eq!(
+        env.ok(&["query"]),
+        format!(
+            "DP-1 1280x720 {} playing\nHDMI-A-1 384x216 color #405060 static\n",
+            gif.display()
+        )
+    );
+    wait("one buffer", || env.mock().live_buffers == 1);
     env.assert_no_errors();
 }

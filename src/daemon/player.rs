@@ -76,6 +76,11 @@ impl Player {
         (self.cache.w, self.cache.h)
     }
 
+    /// The current frame at the stored size.
+    pub fn canvas(&self) -> &[u32] {
+        &self.canvas
+    }
+
     /// Time on screen of the current frame.
     pub fn delay_ns(&self) -> u64 {
         self.cache.delay_ms(self.frame) as u64 * 1_000_000

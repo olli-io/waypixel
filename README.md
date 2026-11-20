@@ -31,6 +31,7 @@ pixelwp img ~/wallpapers/forest.gif       # all outputs
 pixelwp img city.png --output DP-1        # one output
 pixelwp img "$(fzf)"                      # select a file with a shell tool
 pixelwp clear --color 202020              # solid colour (default 000000)
+pixelwp img forest.gif --fx wipe          # transition for this change only
 pixelwp query                             # <name> <w>x<h> <file|color #RRGGBB> <state>
 pixelwp pause
 pixelwp resume
@@ -38,6 +39,30 @@ pixelwp kill
 ```
 
 `<state>` is `playing`, `hidden`, `paused` or `static`.
+
+## Transitions
+
+A change of wallpaper shows a transition, after the effects of
+[ttfx](https://github.com/omacom/ttfx). A transition runs on a grid of
+540 × 270 cells, which gets an integer scale as pixel art does.
+
+| Name | Effect |
+|---|---|
+| `burn` (default) | A fire spreads from a random point. Smoke rises. |
+| `sweep` | A grey shimmer goes from right to left. A colour shimmer comes back and shows the new wallpaper. |
+| `slide` | The new wallpaper comes in from the left, in bands. |
+| `wipe` | A diagonal colour band goes from the top left to the bottom right. |
+| `disabled` | No transition. |
+
+Set the default in `~/.config/pixelwp/config` (`$XDG_CONFIG_HOME/pixelwp/config`):
+
+```
+transition = sweep
+```
+
+The daemon reads the file at each change, so no restart is necessary. `--fx <name>`
+has priority over the file. There is no transition when the old or the new
+image is not pixel art.
 
 Exit codes: 0 = ok, 1 = error, 2 = usage error, 3 = the daemon is not running.
 

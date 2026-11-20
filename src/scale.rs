@@ -51,9 +51,19 @@ impl Geom {
 /// For each 1× row, the first screen row is built with `fill` on runs of k pixels,
 /// then copied k − 1 times. There is no division per pixel.
 pub fn upscale_rect(src: &[u32], dst: &mut [u32], g: &Geom, r: Rect) {
-    let Some((x0, y0, x1, y1)) = g.map(r) else {
-        return;
-    };
+    if let Some(area) = g.map(r) {
+        upscale_screen(src, dst, g, area);
+    }
+}
+
+/// Draws the screen area (x0, y0, x1, y1) of the scaled `src` into `dst`. The
+/// area must be inside the screen and must not be empty.
+pub fn upscale_screen(
+    src: &[u32],
+    dst: &mut [u32],
+    g: &Geom,
+    (x0, y0, x1, y1): (usize, usize, usize, usize),
+) {
     let Geom { k, ox, oy, sw, .. } = *g;
     let (sx0, sx1) = ((x0 + ox) / k, (x1 - 1 + ox) / k);
     let (sy0, sy1) = ((y0 + oy) / k, (y1 - 1 + oy) / k);

@@ -8,7 +8,7 @@ pixelawww (an awww fork) shows pixel art pixel-perfect, but the daemon uses abou
 
 A benchmark on a 9800X3D measured an integer upscale with u32 fill at 0.3 ms for a full 4K frame. So the daemon can keep the art at 1× and scale only the changed areas on each tick. The benchmark buffer fitted in the L3 cache, so the figure must be measured again on a real shm buffer (§15).
 
-pixelwp is a new, minimal rewrite in a new repo, `~/git/pixelwp`. It drops transitions, filters, resize modes, namespaces, SVG, JXL and clap.
+pixelwp is a new, minimal rewrite in a new repo, `~/git/pixelwp`. It drops transitions (but for those of §9a), filters, resize modes, namespaces, SVG, JXL and clap.
 
 User decisions:
 - Pixel art always gets an integer scale, with no aspect-fill fallback. The overflow is cut. This differs from macawww, which falls back to aspect fill when k > 1.25 × the fill scale.
@@ -22,9 +22,9 @@ Goal: the lowest CPU, RAM and power use for animated pixel-art wallpapers on wlr
 
 Non-goals (v1):
 - Animations that are not pixel art.
-- Transitions, playlists, filters, resize modes, namespaces.
+- Playlists, filters, resize modes, namespaces. Transitions other than those of §9a.
 - SVG, JXL, video.
-- A file picker, an installer, a config file, a man page.
+- A file picker, an installer, a man page. A config file with more than the `transition` key.
 - GNOME, which has no layer shell.
 
 ## 2. Targets
@@ -56,8 +56,8 @@ file ─(child: image crate)─▶ pixel-art detect ─▶ 1× frames ─▶ til
 | Command | Action |
 |---|---|
 | `pixelwp daemon` | Start the daemon in the foreground. If a daemon already runs: print a message, exit 0. |
-| `pixelwp img <path> [--output <name\|all>]` | Set the wallpaper. Default `all`. |
-| `pixelwp clear [--color <hex>] [--output ...]` | Solid colour. Default `000000`. |
+| `pixelwp img <path> [--output <name\|all>] [--fx <name>]` | Set the wallpaper. Default `all`. `--fx`: see §9a. |
+| `pixelwp clear [--color <hex>] [--output ...] [--fx ...]` | Solid colour. Default `000000`. |
 | `pixelwp query` | One line per output: `<name> <w>x<h> <file\|color #RRGGBB> <state>` |
 | `pixelwp pause` / `resume` | Manual pause. |
 | `pixelwp kill` | Stop the daemon. |
@@ -71,7 +71,7 @@ file ─(child: image crate)─▶ pixel-art detect ─▶ 1× frames ─▶ til
 ## 5. IPC
 - Socket: `$XDG_RUNTIME_DIR/pixelwp-<WAYLAND_DISPLAY basename>.sock`, mode 0600.
 - One connection carries one request and one reply. Both are plain text.
-- Request: the arguments, each ended by a NUL byte, for example `img\0/a b.gif\0all\0`. The client then shuts down its write side.
+- Request: the arguments, each ended by a NUL byte, for example `img\0/a b.gif\0all\0config\0`. The last argument is the transition name, or `config`. The client then shuts down its write side.
 - Reply: the first line is `ok` or `error <text>`. For `query`, the output lines of §4 follow `ok`. The daemon formats them; the client prints them unchanged.
 - An `img` reply waits until the file is decoded or found in the cache, and the first frame is committed. The daemon holds the connection open and replies when the decode child exits.
 
@@ -162,6 +162,25 @@ The fill is fast, so the dirty rects do not save much daemon CPU. Their purpose 
 - One timerfd (`CLOCK_MONOTONIC`, absolute time) set to the earliest deadline of all running players.
 - The next deadline = the previous deadline + the delay, so the timing does not drift. If the daemon is more than one delay late, it uses now + delay.
 
+## 9a. Transitions
+`img` and `clear` show the change with a transition. The transitions are effects of ttfx, changed from terminal symbols to pixel-art cells. A restore at daemon start has no transition.
+
+- **Selection:** `--fx <burn|sweep|slide|wipe|disabled>`. Without `--fx`, the daemon reads the key `transition = <name>` from `$XDG_CONFIG_HOME/pixelwp/config` at each request. The default is `burn`. A bad value gives a log line and `burn`. Lines without `=` and text after `#` are ignored.
+- **Sweep:** a shimmer of random greys goes from right to left in 40 steps (`in_out_quad`) and leaves the old wallpaper in grey. Then a shimmer of random colours (`8A008A` … `FFFFFF`) goes from left to right and leaves the new wallpaper. A cell shimmers for 4 steps.
+- **Slide:** bands of 6 rows. Band b starts at step b + 1 and moves for 24 steps (`in_out_quad`): the new wallpaper comes in from the left.
+- **Wipe:** the diagonals start from the top left to the bottom right in 50 steps (`in_out_quad`). A cell shows the colours `833AB4` … `FCB045` for 4 steps, then the new wallpaper.
+
+The items below describe burn, and the parts that all transitions share.
+
+- **Grid:** 540 × 270 cells. Each output maps the grid to its screen as for pixel art: integer scale, centred, overflow cut.
+- **Order:** the fire starts at a random cell. The cells start to burn in the link order of the simple Prim's algorithm (a random spanning tree), at a rate that burns all cells in approximately 2 s.
+- **Cell:** old wallpaper → 8 fire colours (`FFFFFF` … `510100`, 11 steps in total) → new wallpaper. One burnt cell in 64 emits a smoke cell that rises for 16 steps (`504F4F` … `C7C7C7`).
+- **Step:** 33 ms, on the timerfd. A step has no allocation.
+- **Images:** the old and the new wallpaper are 1× canvases, each with its own integer scale. A colour is a 1 × 1 canvas. An old animation stops at its current frame. A new animation shows frame 0 and starts after the transition. If one of the two images is not pixel art, there is no transition.
+- **Render:** each cell has a display code (old, new, old in grey, new moved by n cells, or a colour) and the step of its last change. A buffer that holds step j gets only the cells that changed after j. The damage is the bounding box of the cells that changed in the step.
+- **Output:** during the transition, the output has a buffer pool of the physical size. A `configure` or a scale change ends the transition on that output. After the last step, the output builds its normal Target.
+- Manual pause does not stop a transition. An output that is not ready skips steps.
+
 ## 10. Pause rules
 There is no pause timer. Two rules apply:
 
@@ -203,6 +222,7 @@ When no player has a deadline, the timer is disarmed. The current frame stays on
   src/diff.rs        tile diff, rect merge
   src/cache.rs       .pwp writer/reader, validation, cleanup
   src/scale.rs       upscale_rect (u32 fill)
+  src/fx.rs          transitions: cell grid, burn, sweep, slide, wipe, render
   src/daemon/mod.rs      poll loop, IPC server, state file, signals
   src/daemon/wayland.rs  generated protocol include (from pixelawww)
   src/daemon/output.rs   surfaces, viewport, scale, Target

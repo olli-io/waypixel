@@ -7,6 +7,7 @@ use super::pool::Pool;
 use super::wayland::{Obj, Wl, req, zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use crate::cache::{Cache, Hash};
 use crate::diff::Rect;
+use crate::fx::{Canvas, Effect, GRID_H, GRID_W, Kind, Layers};
 use crate::scale::{Geom, upscale_rect};
 
 /// What an output shows.
@@ -18,6 +19,32 @@ pub enum Wall {
     Still { hash: Hash, path: String },
     /// a pixel-art animation, drawn from the player with this id
     Anim { player: u32, path: String },
+}
+
+/// The part of a transition that is specific to one output.
+struct Fx {
+    /// id of the transition
+    id: u32,
+    /// the wallpaper before the transition
+    old: Canvas,
+    /// `old` in grey, for sweep
+    grey: Box<[u32]>,
+    old_geom: Geom,
+    new_geom: Geom,
+    /// grid of the effect → screen
+    geom: Geom,
+    /// the step of the last commit
+    last_committed: u32,
+}
+
+impl Fx {
+    fn layers<'a>(&'a self, new: &'a Canvas) -> Layers<'a> {
+        Layers {
+            old: (&self.old.px, &self.old_geom),
+            new: (&new.px, &self.new_geom),
+            grey: &self.grey,
+        }
+    }
 }
 
 pub struct Output {
@@ -45,6 +72,7 @@ pub struct Output {
     geom: Option<Geom>,
     /// the frame (player `seq`) of the last commit
     last_committed: Option<u64>,
+    fx: Option<Fx>,
 }
 
 impl Output {
@@ -136,6 +164,7 @@ impl Output {
             pool: None,
             geom: None,
             last_committed: None,
+            fx: None,
         }
     }
 
@@ -154,6 +183,16 @@ impl Output {
             Wall::Anim { player, .. } => Some(player),
             _ => None,
         }
+    }
+
+    /// The transition that this output shows.
+    pub fn fx(&self) -> Option<u32> {
+        self.fx.as_ref().map(|fx| fx.id)
+    }
+
+    /// The player that this output draws from. During a transition, this is `None`.
+    pub fn playing(&self) -> Option<u32> {
+        self.player().filter(|_| self.fx.is_none())
     }
 
     /// True when the frame callback of the last commit has arrived.
@@ -175,6 +214,7 @@ impl Output {
         self.callback = None;
         self.geom = None;
         self.last_committed = None;
+        self.fx = None;
         let result = self.build(wl, players, (lw, lh));
         if result.is_err() {
             let black = self.color_pool(wl, 0xFF00_0000);
@@ -331,12 +371,102 @@ impl Output {
         req!(wl, wl_surface::req::commit(surface));
     }
 
+    /// Starts a transition from `old` to `new`, which is the image of the
+    /// wall of this output. Returns false when the output cannot show it.
+    pub fn start_fx(
+        &mut self,
+        wl: &mut Wl,
+        id: u32,
+        effect: &Effect,
+        old: Canvas,
+        new: &Canvas,
+    ) -> bool {
+        if self.logical.is_none() {
+            return false;
+        }
+        let screen = self.physical();
+        let Ok(mut pool) = Pool::new(wl, screen.0, screen.1) else {
+            return false;
+        };
+        if let Some(old_pool) = self.pool.take() {
+            old_pool.destroy(wl);
+        }
+        self.callback = None;
+        self.geom = None;
+        self.last_committed = None;
+        let fx = Fx {
+            id,
+            old_geom: old.geom(screen),
+            new_geom: new.geom(screen),
+            geom: Geom::new((GRID_W as u32, GRID_H as u32), screen),
+            grey: match effect.kind {
+                Kind::Sweep => old.grey(),
+                _ => Box::new([]),
+            },
+            old,
+            last_committed: effect.step,
+        };
+        effect.render(pool.pixels(0), &fx.geom, &fx.layers(new), None);
+        pool.bufs[0].holds = Some(effect.step as u64);
+        self.fx = Some(fx);
+        self.commit_full(wl, Some(pool), None, true);
+        true
+    }
+
+    /// Draws the current step of the transition: only the cells that changed.
+    /// There is no allocation when a buffer is free.
+    pub fn fx_tick(&mut self, wl: &mut Wl, effect: &Effect, new: &Canvas) {
+        let (Some(pool), Some(fx)) = (&mut self.pool, &mut self.fx) else {
+            return;
+        };
+        if fx.last_committed == effect.step {
+            return;
+        }
+        let damage = if fx.last_committed + 1 == effect.step {
+            let Some(area) = effect.changed().and_then(|r| fx.geom.map(r)) else {
+                // no change on this screen
+                fx.last_committed = effect.step;
+                return;
+            };
+            area
+        } else {
+            (0, 0, fx.geom.sw, fx.geom.sh)
+        };
+        let Some(i) = pool.acquire(wl) else {
+            return;
+        };
+        let holds = pool.bufs[i].holds.map(|step| step as u32);
+        effect.render(pool.pixels(i), &fx.geom, &fx.layers(new), holds);
+        pool.bufs[i].holds = Some(effect.step as u64);
+        pool.bufs[i].busy = true;
+        fx.last_committed = effect.step;
+
+        let surface = self.surface;
+        let (x0, y0, x1, y1) = damage;
+        req!(
+            wl,
+            wl_surface::req::attach(surface, Some(pool.bufs[i].id), 0, 0)
+        );
+        req!(
+            wl,
+            wl_surface::req::damage_buffer(
+                surface,
+                x0 as i32,
+                y0 as i32,
+                (x1 - x0) as i32,
+                (y1 - y0) as i32
+            )
+        );
+        self.request_frame(wl);
+        req!(wl, wl_surface::req::commit(surface));
+    }
+
     /// Handles `wl_buffer.release`. Returns false when the buffer is not from this output.
     ///
     /// A still or a colour needs its buffer only one time: the pool is destroyed
     /// when the compositor has released it.
     pub fn released(&mut self, wl: &mut Wl, buffer: ObjectId) -> bool {
-        let animated = self.player().is_some();
+        let animated = self.player().is_some() || self.fx.is_some();
         let Some(pool) = &mut self.pool else {
             return false;
         };

@@ -23,6 +23,7 @@ use rustix::time::{
 use waybackend::types::ObjectId;
 
 use crate::cache::{self, Cache, Hash};
+use crate::fx::{Canvas, Effect, Kind, STEP_NS};
 use crate::ipc;
 use output::{Output, Wall};
 use player::Player;
@@ -198,6 +199,21 @@ impl State {
 
 // ---- daemon -----------------------------------------------------------------
 
+/// The transition of a request. `config` is the `transition` key of
+/// `$XDG_CONFIG_HOME/pixelwp/config`. The file is read for each request, so a
+/// change needs no restart. A bad file gives a log line and the default.
+fn transition(name: &str) -> Result<Option<Kind>, String> {
+    if name != "config" {
+        return Kind::parse(name).ok_or(format!("bad transition {name}"));
+    }
+    let path = ipc::xdg_dir("XDG_CONFIG_HOME", ".config").join("pixelwp/config");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    Ok(Kind::from_config(&text).unwrap_or_else(|e| {
+        eprintln!("pixelwp: {}: {e}", path.display());
+        Some(Kind::Burn)
+    }))
+}
+
 /// An output for which `wl_output.done` has not arrived.
 struct Pending {
     global: u32,
@@ -225,6 +241,20 @@ struct Job {
     client: Option<u64>,
     /// false for a restore: the state file does not change
     persist: bool,
+    /// show the change with this transition
+    fx: Option<Kind>,
+}
+
+/// A transition to one wall. All outputs that got the wall with one
+/// request show the same transition.
+struct Transition {
+    id: u32,
+    wall: Wall,
+    effect: Effect,
+    /// the image of `wall`
+    new: Canvas,
+    /// `CLOCK_MONOTONIC` time in ns of the next step
+    deadline: u64,
 }
 
 struct Daemon {
@@ -233,6 +263,8 @@ struct Daemon {
     outputs: Vec<Output>,
     players: Vec<Player>,
     next_player: u32,
+    transitions: Vec<Transition>,
+    next_transition: u32,
     paused: bool,
     /// exit code, when the daemon must stop
     exit: Option<i32>,
@@ -298,8 +330,108 @@ impl Daemon {
         Ok(Wall::Anim { player: id, path })
     }
 
-    /// Sets the wall of an output from the state and renders it.
-    fn assign(&mut self, index: usize) {
+    /// The 1× image of a wall. `None` for an image that is not pixel art.
+    fn canvas_of(&self, wall: &Wall) -> Option<Canvas> {
+        match wall {
+            Wall::Color(color) => Some(Canvas::color(*color)),
+            Wall::Still { hash, .. } => {
+                let cache = Cache::open(&cache::path_for(hash)).ok()?;
+                if !cache.pixel_art {
+                    return None;
+                }
+                let mut px = vec![0u32; cache.w as usize * cache.h as usize];
+                cache.apply(0, &mut px, &mut []).ok()?;
+                Some(Canvas {
+                    w: cache.w,
+                    h: cache.h,
+                    px: px.into(),
+                })
+            }
+            Wall::Anim { player, .. } => {
+                let p = self.players.iter().find(|p| p.id == *player)?;
+                let (w, h) = p.size();
+                Some(Canvas {
+                    w,
+                    h,
+                    px: p.canvas().into(),
+                })
+            }
+        }
+    }
+
+    /// Starts a transition from `old` to the wall of the output. Returns
+    /// false when there is no transition: one of the images is not pixel art.
+    fn start_fx(&mut self, index: usize, old: &Wall, kind: Kind) -> bool {
+        let Some(old) = self.canvas_of(old) else {
+            return false;
+        };
+        let wall = &self.outputs[index].wall;
+        // the transition that an earlier output of the same request started
+        let found = self
+            .transitions
+            .iter()
+            .position(|t| t.effect.step == 0 && t.effect.kind == kind && t.wall == *wall);
+        let t = match found {
+            Some(t) => t,
+            None => {
+                let Some(new) = self.canvas_of(wall) else {
+                    return false;
+                };
+                let now = now_ns();
+                self.transitions.push(Transition {
+                    id: self.next_transition,
+                    wall: wall.clone(),
+                    effect: Effect::new(kind, now),
+                    new,
+                    deadline: now + STEP_NS,
+                });
+                self.next_transition += 1;
+                self.transitions.len() - 1
+            }
+        };
+        let t = &self.transitions[t];
+        self.outputs[index].start_fx(&mut self.wl, t.id, &t.effect, old, &t.new)
+    }
+
+    /// Advances the transitions whose deadline has come, and renders their
+    /// ready outputs. When a transition is complete, its outputs show the wall.
+    ///
+    /// This is a tick path: there is no allocation and no log, but for the last step.
+    fn run_transitions(&mut self) {
+        if self.transitions.is_empty() {
+            return;
+        }
+        let now = now_ns();
+        let mut i = 0;
+        while i < self.transitions.len() {
+            let t = &mut self.transitions[i];
+            if t.deadline > now {
+                i += 1;
+                continue;
+            }
+            if t.effect.advance() {
+                for o in &mut self.outputs {
+                    if o.fx() == Some(t.id) && o.ready() {
+                        o.fx_tick(&mut self.wl, &t.effect, &t.new);
+                    }
+                }
+                let late = now - t.deadline > STEP_NS;
+                t.deadline = if late { now } else { t.deadline } + STEP_NS;
+                i += 1;
+                continue;
+            }
+            let id = self.transitions.swap_remove(i).id;
+            for index in 0..self.outputs.len() {
+                if self.outputs[index].fx() == Some(id) {
+                    self.rebuild(index);
+                }
+            }
+        }
+    }
+
+    /// Sets the wall of an output from the state and renders it. With `fx`, a
+    /// transition shows the change.
+    fn assign(&mut self, index: usize, fx: Option<Kind>) {
         let spec = self
             .state
             .lookup(&self.outputs[index].name)
@@ -315,13 +447,27 @@ impl Daemon {
             }),
             _ => Wall::Color(BLACK),
         };
-        self.outputs[index].wall = wall;
+        let old = std::mem::replace(&mut self.outputs[index].wall, wall);
+        if let Some(kind) = fx
+            && old != self.outputs[index].wall
+            && self.start_fx(index, &old, kind)
+        {
+            return;
+        }
         self.rebuild(index);
     }
 
     fn rebuild(&mut self, index: usize) {
         let output = &mut self.outputs[index];
         let Err(e) = output.rebuild(&mut self.wl, &self.players) else {
+            // A player stops during a transition. It starts again here.
+            let id = output.player();
+            if let Some(p) = self.players.iter_mut().find(|p| Some(p.id) == id)
+                && p.deadline.is_none()
+                && !self.paused
+            {
+                p.deadline = Some(now_ns() + p.delay_ns());
+            }
             return;
         };
         eprintln!("pixelwp: {}: {e}", output.name);
@@ -331,21 +477,21 @@ impl Daemon {
             && let Some(entry) = self.state.lookup(&output.name)
         {
             let (path, target) = (path.clone(), entry.target.clone());
-            if let Err(e) = self.start_img(&path, &target, None, false) {
+            if let Err(e) = self.start_img(&path, &target, None, false, None) {
                 eprintln!("pixelwp: {e}");
             }
         }
     }
 
     /// Assigns again all outputs that use the state line `target`.
-    fn apply_target(&mut self, target: &str) {
+    fn apply_target(&mut self, target: &str, fx: Option<Kind>) {
         for index in 0..self.outputs.len() {
             let uses = self
                 .state
                 .lookup(&self.outputs[index].name)
                 .is_some_and(|e| e.target == target);
             if uses {
-                self.assign(index);
+                self.assign(index, fx);
             }
         }
     }
@@ -356,6 +502,8 @@ impl Daemon {
         let outputs = &self.outputs;
         self.players
             .retain(|p| outputs.iter().any(|o| o.player() == Some(p.id)));
+        self.transitions
+            .retain(|t| outputs.iter().any(|o| o.fx() == Some(t.id)));
         if self.restoring {
             return;
         }
@@ -387,12 +535,13 @@ impl Daemon {
         target: &str,
         client: Option<u64>,
         persist: bool,
+        fx: Option<Kind>,
     ) -> Result<bool, String> {
         let hash =
             cache::hash_file(path.as_ref()).map_err(|e| format!("cannot read {path}: {e}"))?;
         let cache_path = cache::path_for(&hash);
         if Cache::open(&cache_path).is_ok() {
-            self.apply_image(target, path, hash, persist);
+            self.apply_image(target, path, hash, persist, fx);
             return Ok(true);
         }
         _ = std::fs::remove_file(&cache_path);
@@ -428,12 +577,20 @@ impl Daemon {
             target: target.to_owned(),
             client,
             persist,
+            fx,
         });
         Ok(false)
     }
 
     /// Makes an image with a valid cache file the wall of `target`.
-    fn apply_image(&mut self, target: &str, path: &str, hash: Hash, persist: bool) {
+    fn apply_image(
+        &mut self,
+        target: &str,
+        path: &str,
+        hash: Hash,
+        persist: bool,
+        fx: Option<Kind>,
+    ) {
         if persist {
             let spec = Spec::Img {
                 path: path.to_owned(),
@@ -451,7 +608,7 @@ impl Daemon {
                 _ => return,
             }
         }
-        self.apply_target(target);
+        self.apply_target(target, fx);
         self.gc();
     }
 
@@ -463,7 +620,7 @@ impl Daemon {
         let mut job = self.jobs.swap_remove(index);
         let ok = job.child.wait().is_ok_and(|status| status.success());
         let result = if ok && Cache::open(&cache::path_for(&job.hash)).is_ok() {
-            self.apply_image(&job.target, &job.path, job.hash, job.persist);
+            self.apply_image(&job.target, &job.path, job.hash, job.persist, job.fx);
             Ok(String::new())
         } else {
             let mut text = String::new();
@@ -490,10 +647,12 @@ impl Daemon {
                 Wall::Color(c) => (format!("color #{:06X}", c & 0xFF_FFFF), "static"),
                 Wall::Still { path, .. } => (path.clone(), "static"),
                 Wall::Anim { player, path } => {
-                    let playing = self
-                        .players
-                        .iter()
-                        .any(|p| p.id == *player && p.deadline.is_some());
+                    // the animation starts after the transition
+                    let playing = o.fx().is_some()
+                        || self
+                            .players
+                            .iter()
+                            .any(|p| p.id == *player && p.deadline.is_some());
                     let state = match (self.paused, playing) {
                         (true, _) => "paused",
                         (false, true) => "playing",
@@ -531,7 +690,11 @@ impl Daemon {
                 self.exit = Some(0);
                 ok()
             }
-            ["clear", color, target] => {
+            ["clear", color, target, fx] => {
+                let fx = match transition(fx) {
+                    Ok(fx) => fx,
+                    Err(e) => return Some(Err(e)),
+                };
                 let Some(color) = ipc::parse_color(color) else {
                     return Some(Err(format!("bad colour {color}")));
                 };
@@ -540,18 +703,22 @@ impl Daemon {
                 }
                 self.state.set(target, Spec::Color(color));
                 self.state.save();
-                self.apply_target(target);
+                self.apply_target(target, fx);
                 self.gc();
                 ok()
             }
-            ["img", path, target] => {
+            ["img", path, target, fx] => {
+                let fx = match transition(fx) {
+                    Ok(fx) => fx,
+                    Err(e) => return Some(Err(e)),
+                };
                 if path.contains('\n') {
                     return Some(Err("the path contains a newline".into()));
                 }
                 if let Err(e) = self.check_target(target) {
                     return Some(Err(e));
                 }
-                match self.start_img(path, target, Some(client), true) {
+                match self.start_img(path, target, Some(client), true, fx) {
                     Ok(true) => ok(),
                     Ok(false) => None,
                     Err(e) => Some(Err(e)),
@@ -649,7 +816,7 @@ impl Daemon {
             let id = Some(p.id);
             // An output is ready when the frame callback of its last commit has arrived.
             // With no ready output, the player is hidden: it has no deadline.
-            let any_ready = self.outputs.iter().any(|o| o.player() == id && o.ready());
+            let any_ready = self.outputs.iter().any(|o| o.playing() == id && o.ready());
             if !any_ready || p.advance().is_err() {
                 p.deadline = None;
                 continue;
@@ -657,7 +824,7 @@ impl Daemon {
             for o in self
                 .outputs
                 .iter_mut()
-                .filter(|o| o.player() == id && o.ready())
+                .filter(|o| o.playing() == id && o.ready())
             {
                 o.tick(&mut self.wl, p);
             }
@@ -675,7 +842,13 @@ impl Daemon {
 
     /// Sets the timerfd to the earliest deadline, or disarms it.
     fn arm_timer(&mut self) {
-        let want = self.players.iter().filter_map(|p| p.deadline).min();
+        let steps = self.transitions.iter().map(|t| t.deadline);
+        let want = self
+            .players
+            .iter()
+            .filter_map(|p| p.deadline)
+            .chain(steps)
+            .min();
         if self.armed == Some(want) {
             return;
         }
@@ -772,7 +945,7 @@ impl wayland::wl_output::EvHandler for Daemon {
             Wall::Color(BLACK),
         );
         self.outputs.push(output);
-        self.assign(self.outputs.len() - 1);
+        self.assign(self.outputs.len() - 1, None);
     }
 
     fn scale(&mut self, sender: ObjectId, factor: i32) {
@@ -851,7 +1024,7 @@ impl wayland::wl_callback::EvHandler for Daemon {
             return;
         }
         // A hidden player starts again when one of its outputs is ready.
-        let id = o.player();
+        let id = o.playing();
         if let Some(p) = self.players.iter_mut().find(|p| Some(p.id) == id)
             && p.deadline.is_none()
         {
@@ -978,6 +1151,8 @@ fn run_inner() -> Result<i32, String> {
         outputs: Vec::new(),
         players: Vec::new(),
         next_player: 1,
+        transitions: Vec::new(),
+        next_transition: 1,
         paused: false,
         exit: None,
         state: State::load(),
@@ -1003,7 +1178,7 @@ fn run_inner() -> Result<i32, String> {
         })
         .collect();
     for (target, path) in images {
-        if let Err(e) = daemon.start_img(&path, &target, None, false) {
+        if let Err(e) = daemon.start_img(&path, &target, None, false, None) {
             eprintln!("pixelwp: {e}");
         }
     }
@@ -1018,6 +1193,7 @@ fn run_inner() -> Result<i32, String> {
     let borrow = |fd: BorrowedFd<'_>| unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
 
     let code = loop {
+        daemon.run_transitions();
         daemon.run_players();
         daemon.arm_timer();
         let flushed = daemon.wl.flush();

@@ -7,6 +7,7 @@ mod client;
 mod daemon;
 mod decode;
 mod diff;
+mod fx;
 mod ipc;
 mod pixelart;
 mod scale;
@@ -16,11 +17,16 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 Usage:
   pixelwp daemon                                 start the daemon in the foreground
-  pixelwp img <path> [--output <name|all>]       set the wallpaper (default: all)
-  pixelwp clear [--color <hex>] [--output ...]   solid colour (default: 000000)
+  pixelwp img <path> [--output <name|all>] [--fx <name>]
+                                                 set the wallpaper (default: all)
+  pixelwp clear [--color <hex>] [--output ...] [--fx ...]
+                                                 solid colour (default: 000000)
   pixelwp query                                  one line for each output
   pixelwp pause | resume                         manual pause
   pixelwp kill                                   stop the daemon
+
+--fx is the transition: burn, sweep, slide, wipe or disabled. The default is the
+`transition` key in ~/.config/pixelwp/config, or else burn.
 
 Exit codes: 0 = ok, 1 = error, 2 = usage error, 3 = the daemon is not running";
 
@@ -30,10 +36,12 @@ enum Cmd {
     Img {
         path: String,
         output: String,
+        fx: String,
     },
     Clear {
         color: String,
         output: String,
+        fx: String,
     },
     Query,
     Pause,
@@ -47,12 +55,24 @@ enum Cmd {
     Help,
 }
 
-/// Positional arguments and the values of `--output` and `--color`.
+/// Positional arguments and the values of `--output`, `--color` and `--fx`.
 #[derive(Default)]
 struct Parsed {
     positional: Vec<String>,
     output: Option<String>,
     color: Option<String>,
+    fx: Option<String>,
+}
+
+impl Parsed {
+    /// The name of the transition. `config` (default): the daemon reads the config file.
+    fn fx(&self) -> Result<String, String> {
+        match self.fx.as_deref() {
+            None => Ok("config".into()),
+            Some(name) if fx::Kind::parse(name).is_some() => Ok(name.into()),
+            Some(other) => Err(format!("bad transition {other}: use {}", fx::Kind::NAMES)),
+        }
+    }
 }
 
 fn parse_options(args: &[String], allowed: &[&str]) -> Result<Parsed, String> {
@@ -86,6 +106,7 @@ fn parse_options(args: &[String], allowed: &[&str]) -> Result<Parsed, String> {
         };
         match name {
             "--output" => parsed.output = Some(value),
+            "--fx" => parsed.fx = Some(value),
             _ => parsed.color = Some(value),
         }
     }
@@ -111,26 +132,28 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
         "resume" => no_args(Cmd::Resume),
         "kill" => no_args(Cmd::Kill),
         "img" => {
-            let p = parse_options(rest, &["--output"])?;
+            let p = parse_options(rest, &["--output", "--fx"])?;
             let [path] = p.positional.as_slice() else {
                 return Err("img needs one path".into());
             };
             Ok(Cmd::Img {
                 path: path.clone(),
+                fx: p.fx()?,
                 output: p.output.unwrap_or_else(|| "all".into()),
             })
         }
         "clear" => {
-            let p = parse_options(rest, &["--output", "--color"])?;
+            let p = parse_options(rest, &["--output", "--color", "--fx"])?;
             if !p.positional.is_empty() {
                 return Err("clear takes no path".into());
             }
-            let color = p.color.unwrap_or_else(|| "000000".into());
+            let color = p.color.clone().unwrap_or_else(|| "000000".into());
             if ipc::parse_color(&color).is_none() {
                 return Err(format!("bad colour {color}: use RRGGBB"));
             }
             Ok(Cmd::Clear {
                 color,
+                fx: p.fx()?,
                 output: p.output.unwrap_or_else(|| "all".into()),
             })
         }
@@ -170,11 +193,11 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Cmd::Img { path, output } => {
+        Cmd::Img { path, output, fx } => {
             // the daemon has a different working directory
             match std::fs::canonicalize(&path) {
                 Ok(abs) => match abs.to_str() {
-                    Some(abs) => client::request(&["img", abs, &output]),
+                    Some(abs) => client::request(&["img", abs, &output, &fx]),
                     None => {
                         eprintln!("pixelwp: {path}: the path is not UTF-8");
                         1
@@ -186,7 +209,7 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Cmd::Clear { color, output } => client::request(&["clear", &color, &output]),
+        Cmd::Clear { color, output, fx } => client::request(&["clear", &color, &output, &fx]),
         Cmd::Query => client::request(&["query"]),
         Cmd::Pause => client::request(&["pause"]),
         Cmd::Resume => client::request(&["resume"]),
@@ -212,6 +235,7 @@ mod tests {
             Ok(Cmd::Img {
                 path: path.into(),
                 output: output.into(),
+                fx: "config".into(),
             })
         };
         assert_eq!(p(&["img", "a b.gif"]), img("a b.gif", "all"));
@@ -228,6 +252,7 @@ mod tests {
             Ok(Cmd::Clear {
                 color: color.into(),
                 output: output.into(),
+                fx: "config".into(),
             })
         };
         assert_eq!(p(&["clear"]), clear("000000", "all"));
@@ -241,6 +266,10 @@ mod tests {
         assert!(p(&["img", "a", "b"]).is_err());
         assert!(p(&["img", "a", "--color", "000000"]).is_err());
         assert!(p(&["img", "a", "--output"]).is_err());
+        assert!(p(&["img", "a", "--fx", "melt"]).is_err());
+        assert!(
+            matches!(p(&["clear", "--fx=disabled"]), Ok(Cmd::Clear { fx, .. }) if fx == "disabled")
+        );
         assert!(p(&["clear", "--color", "red"]).is_err());
         assert!(p(&["query", "x"]).is_err());
         assert!(p(&["frobnicate"]).is_err());
