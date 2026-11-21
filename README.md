@@ -1,4 +1,4 @@
-# pixelwp
+# waypixel
 
 A minimal wallpaper daemon for animated pixel art on wlroots-type Wayland
 compositors (compositors with `zwlr_layer_shell_v1`: Sway, Hyprland, river, niri, ...).
@@ -7,7 +7,7 @@ compositors (compositors with `zwlr_layer_shell_v1`: Sway, Hyprland, river, niri
   The image is centred and the overflow is cut.
 - An image is pixel art when it is an integer upscale (2× or more), or when it
   is small (no side longer than 640 px) and has 256 colours or fewer.
-- Other images are rejected: `pixelwp img` prints an error and shows a desktop
+- Other images are rejected: `waypixel img` prints an error and shows a desktop
   notification (with `notify-send`, if it is installed).
 - The daemon keeps the art at 1× and draws only the changed areas on each frame.
 - The animation stops when the compositor does not show the wallpaper.
@@ -29,19 +29,19 @@ unit. To install only the binary: `cargo install --path .`
 ## Use
 
 ```sh
-pixelwp daemon &                          # start the daemon (foreground process)
-pixelwp img ~/wallpapers/forest.gif       # all outputs
-pixelwp img city.png --output DP-1        # one output
-pixelwp img "$(fzf)"                      # select a file with a shell tool
-pixelwp clear --color 202020              # solid colour (default 000000)
-pixelwp img forest.gif --fx wipe          # transition for this change only
-pixelwp img forest.gif --anchor bottom    # keep the bottom edge in view
-pixelwp query                             # <name> <w>x<h> <file|color #RRGGBB> <state> [<anchor>]
-pixelwp still ~/lock.png                  # first frame of the largest output, as a PNG
-pixelwp still ~/lock.png --output DP-1    # first frame of one output
-pixelwp pause
-pixelwp resume
-pixelwp kill
+waypixel daemon &                          # start the daemon (foreground process)
+waypixel img ~/wallpapers/forest.gif       # all outputs
+waypixel img city.png --output DP-1        # one output
+waypixel img "$(fzf)"                      # select a file with a shell tool
+waypixel clear --color 202020              # solid colour (default 000000)
+waypixel img forest.gif --fx wipe          # transition for this change only
+waypixel img forest.gif --anchor bottom    # keep the bottom edge in view
+waypixel query                             # <name> <w>x<h> <file|color #RRGGBB> <state> [<anchor>]
+waypixel still ~/lock.png                  # first frame of the largest output, as a PNG
+waypixel still ~/lock.png --output DP-1    # first frame of one output
+waypixel pause
+waypixel resume
+waypixel kill
 ```
 
 `<state>` is `playing`, `hidden`, `paused` or `static`.
@@ -65,7 +65,7 @@ A change of wallpaper shows a transition, after the effects of
 | `wipe` | A diagonal colour band goes from the top left to the bottom right. |
 | `disabled` | No transition. |
 
-Set the default in `~/.config/pixelwp/config` (`$XDG_CONFIG_HOME/pixelwp/config`):
+Set the default in `~/.config/waypixel/config` (`$XDG_CONFIG_HOME/waypixel/config`):
 
 ```
 transition = sweep
@@ -80,15 +80,15 @@ wallpaper.
 Exit codes: 0 = ok, 1 = error, 2 = usage error, 3 = the daemon is not running.
 
 The daemon keeps the last wallpaper of each output in
-`$XDG_STATE_HOME/pixelwp/state` and shows it again at the next start. Decoded
-images are in `$XDG_CACHE_HOME/pixelwp/`. The daemon deletes the cache files
+`$XDG_STATE_HOME/waypixel/state` and shows it again at the next start. Decoded
+images are in `$XDG_CACHE_HOME/waypixel/`. The daemon deletes the cache files
 that no output uses.
 
 ## Lock screen
 
 A session lock hides the wallpaper, and lock screens such as hyprlock do not
-play a GIF. `pixelwp still` writes the first frame as a PNG, with the same
-integer scale as the wallpaper. Run it after each `pixelwp img`, and give the
+play a GIF. `waypixel still` writes the first frame as a PNG, with the same
+integer scale as the wallpaper. Run it after each `waypixel img`, and give the
 file to the lock screen:
 
 ```
@@ -104,20 +104,20 @@ background {
 
 ```sh
 mkdir -p ~/.config/systemd/user
-cp pixelwp.service ~/.config/systemd/user/
+cp waypixel.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now pixelwp.service
+systemctl --user enable --now waypixel.service
 ```
 
-The unit starts `~/.cargo/bin/pixelwp daemon` with `graphical-session.target`.
+The unit starts `~/.cargo/bin/waypixel daemon` with `graphical-session.target`.
 The compositor must put `WAYLAND_DISPLAY` into the systemd user environment.
-Logs: `journalctl --user -u pixelwp`.
+Logs: `journalctl --user -u waypixel`.
 
 ## Tests and measurements
 
 ```sh
 cargo test                       # unit tests + tests against a mock compositor
 cargo test --release bench_fill_4k -- --ignored --nocapture
-grep Rss /proc/$(pidof pixelwp)/smaps_rollup
-pidstat -p $(pidof pixelwp) 1
+grep Rss /proc/$(pidof waypixel)/smaps_rollup
+pidstat -p $(pidof waypixel) 1
 ```

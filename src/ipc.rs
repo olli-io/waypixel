@@ -28,7 +28,7 @@ pub fn wayland_display() -> std::ffi::OsString {
     }
 }
 
-/// `$XDG_RUNTIME_DIR/pixelwp-<WAYLAND_DISPLAY basename>.sock`
+/// `$XDG_RUNTIME_DIR/waypixel-<WAYLAND_DISPLAY basename>.sock`
 pub fn socket_path() -> PathBuf {
     let display = wayland_display();
     let base = Path::new(&display)
@@ -36,7 +36,7 @@ pub fn socket_path() -> PathBuf {
         .unwrap_or(display.as_os_str())
         .to_string_lossy()
         .into_owned();
-    runtime_dir().join(format!("pixelwp-{base}.sock"))
+    runtime_dir().join(format!("waypixel-{base}.sock"))
 }
 
 pub fn encode(args: &[&str]) -> Vec<u8> {

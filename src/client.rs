@@ -22,7 +22,7 @@ pub fn request(args: &[&str]) -> i32 {
 /// Returns the reply body. On an error, prints the text and returns the exit code.
 pub fn fetch(args: &[&str]) -> Result<String, i32> {
     let Ok(mut stream) = UnixStream::connect(ipc::socket_path()) else {
-        eprintln!("pixelwp: the daemon is not running");
+        eprintln!("waypixel: the daemon is not running");
         return Err(3);
     };
     let mut reply = String::new();
@@ -31,7 +31,7 @@ pub fn fetch(args: &[&str]) -> Result<String, i32> {
         .and_then(|()| stream.shutdown(Shutdown::Write))
         .and_then(|()| stream.read_to_string(&mut reply));
     if let Err(e) = io {
-        eprintln!("pixelwp: {e}");
+        eprintln!("waypixel: {e}");
         return Err(1);
     }
     let (status, body) = reply.split_once('\n').unwrap_or((&reply, ""));
@@ -41,7 +41,7 @@ pub fn fetch(args: &[&str]) -> Result<String, i32> {
         let text = status
             .strip_prefix("error ")
             .unwrap_or("bad reply from the daemon");
-        eprintln!("pixelwp: {text}");
+        eprintln!("waypixel: {text}");
         if text == NOT_PIXEL_ART {
             notify(args.get(1).copied().unwrap_or_default(), text);
         }
@@ -54,7 +54,7 @@ pub fn fetch(args: &[&str]) -> Result<String, i32> {
 fn notify(path: &str, text: &str) {
     let name = path.rsplit('/').next().unwrap_or(path);
     _ = Command::new("notify-send")
-        .args(["--app-name=pixelwp", "pixelwp"])
+        .args(["--app-name=waypixel", "waypixel"])
         .arg(format!("{name}: {text}"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())

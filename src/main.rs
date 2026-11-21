@@ -1,4 +1,4 @@
-//! pixelwp: animated pixel-art wallpapers for wlroots-type Wayland compositors.
+//! waypixel: animated pixel-art wallpapers for wlroots-type Wayland compositors.
 //!
 //! One binary with three roles: the daemon, the client, and the decode child.
 
@@ -17,19 +17,19 @@ use std::process::ExitCode;
 
 const USAGE: &str = "\
 Usage:
-  pixelwp daemon                                 start the daemon in the foreground
-  pixelwp img <path> [--output <name|all>] [--fx <name>] [--anchor <name>]
+  waypixel daemon                                 start the daemon in the foreground
+  waypixel img <path> [--output <name|all>] [--fx <name>] [--anchor <name>]
                                                  set the wallpaper (default: all)
-  pixelwp clear [--color <hex>] [--output ...] [--fx ...]
+  waypixel clear [--color <hex>] [--output ...] [--fx ...]
                                                  solid colour (default: 000000)
-  pixelwp query                                  one line for each output
-  pixelwp still <file.png> [--output <name>]     write the wallpaper of one output as a PNG
+  waypixel query                                  one line for each output
+  waypixel still <file.png> [--output <name>]     write the wallpaper of one output as a PNG
                                                  (default: the largest output)
-  pixelwp pause | resume                         manual pause
-  pixelwp kill                                   stop the daemon
+  waypixel pause | resume                         manual pause
+  waypixel kill                                   stop the daemon
 
 --fx is the transition: burn, sweep, slide, wipe or disabled. The default is the
-`transition` key in ~/.config/pixelwp/config, or else burn.
+`transition` key in ~/.config/waypixel/config, or else burn.
 
 --anchor is the part of the image that stays in view when the scale cuts the
 overflow: center (default), top, bottom, left, right, topleft, topright,
@@ -203,7 +203,7 @@ fn main() -> ExitCode {
     let cmd = match parse(&args) {
         Ok(cmd) => cmd,
         Err(e) => {
-            eprintln!("pixelwp: {e}\n{USAGE}");
+            eprintln!("waypixel: {e}\n{USAGE}");
             return ExitCode::from(2);
         }
     };
@@ -234,12 +234,12 @@ fn main() -> ExitCode {
                 Ok(abs) => match abs.to_str() {
                     Some(abs) => client::request(&["img", abs, &output, &fx, &anchor]),
                     None => {
-                        eprintln!("pixelwp: {path}: the path is not UTF-8");
+                        eprintln!("waypixel: {path}: the path is not UTF-8");
                         1
                     }
                 },
                 Err(e) => {
-                    eprintln!("pixelwp: {path}: {e}");
+                    eprintln!("waypixel: {path}: {e}");
                     1
                 }
             }

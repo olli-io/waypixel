@@ -127,7 +127,7 @@ impl Output {
                 surface,
                 Some(wl_output),
                 zwlr_layer_shell_v1::Layer::background,
-                "pixelwp"
+                "waypixel"
             )
         );
         let viewport = wl.objman.create(Obj::Viewport);
@@ -259,11 +259,7 @@ impl Output {
         Some(pool)
     }
 
-    fn build(
-        &mut self,
-        wl: &mut Wl,
-        players: &[Player],
-    ) -> Result<(), String> {
+    fn build(&mut self, wl: &mut Wl, players: &[Player]) -> Result<(), String> {
         let (pw, ph) = self.physical();
         let shm = |e: rustix::io::Errno| format!("cannot create a shm buffer: {e}");
         match &self.wall {
@@ -303,12 +299,7 @@ impl Output {
     }
 
     /// Attaches buffer 0 of the pool with full damage and commits.
-    fn commit_full(
-        &mut self,
-        wl: &mut Wl,
-        pool: Option<Pool>,
-        frame: bool,
-    ) {
+    fn commit_full(&mut self, wl: &mut Wl, pool: Option<Pool>, frame: bool) {
         let Some(mut pool) = pool else {
             return;
         };

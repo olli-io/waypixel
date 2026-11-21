@@ -1,4 +1,4 @@
-# pixelwp: spec and plan
+# waypixel: spec and plan
 
 ## Context
 pixelawww (an awww fork) shows pixel art pixel-perfect, but the daemon uses about 150 MB of RAM. macawww uses about 10 MB. The causes:
@@ -8,12 +8,12 @@ pixelawww (an awww fork) shows pixel art pixel-perfect, but the daemon uses abou
 
 A benchmark on a 9800X3D measured an integer upscale with u32 fill at 0.3 ms for a full 4K frame. So the daemon can keep the art at 1× and scale only the changed areas on each tick. The benchmark buffer fitted in the L3 cache, so the figure must be measured again on a real shm buffer (§15).
 
-pixelwp is a new, minimal rewrite in a new repo, `~/git/pixelwp`. It drops transitions (but for those of §9a), filters, resize modes, namespaces, SVG, JXL and clap.
+waypixel is a new, minimal rewrite in a new repo, `~/git/waypixel`. It drops transitions (but for those of §9a), filters, resize modes, namespaces, SVG, JXL and clap.
 
 User decisions:
 - Pixel art always gets an integer scale, with no aspect-fill fallback. The overflow is cut. This differs from macawww, which falls back to aspect fill when k > 1.25 × the fill scale.
 - Other images are rejected. The client prints the error and runs `notify-send` to show a desktop notification. If `notify-send` is not installed, there is no notification.
-- No D-Bus in pixelwp. The only pause signals are missing frame callbacks (`hidden`) and manual `pause`.
+- No D-Bus in waypixel. The only pause signals are missing frame callbacks (`hidden`) and manual `pause`.
 
 ---
 
@@ -37,14 +37,14 @@ Non-goals (v1):
 | Binary | < 3 MB, release, stripped |
 
 ## 3. Architecture
-One Rust binary, `pixelwp`, with three roles:
-- **Daemon** (`pixelwp daemon`). It owns the Wayland connection, the outputs, the players and the cache reader. It is single-threaded, with one `poll` loop on these fds: Wayland, the IPC listener, the IPC client connections, one timerfd, a signalfd, and one pidfd for each running decode child.
+One Rust binary, `waypixel`, with three roles:
+- **Daemon** (`waypixel daemon`). It owns the Wayland connection, the outputs, the players and the cache reader. It is single-threaded, with one `poll` loop on these fds: Wayland, the IPC listener, the IPC client connections, one timerfd, a signalfd, and one pidfd for each running decode child.
 - **Client** (all other subcommands). It sends one request and prints the reply.
-- **Decode child** (`pixelwp decode <src> <dst>`, internal). It runs the `image` crate and writes the cache file. All decode memory goes away when the child exits. The daemon never decodes.
+- **Decode child** (`waypixel decode <src> <dst>`, internal). It runs the `image` crate and writes the cache file. All decode memory goes away when the child exits. The daemon never decodes.
 
 Data flow:
 ```
-file ─(child: image crate)─▶ pixel-art detect ─▶ 1× frames ─▶ tile diff + LZ4 ─▶ cache .pwp
+file ─(child: image crate)─▶ pixel-art detect ─▶ 1× frames ─▶ tile diff + LZ4 ─▶ cache .wpx
                                                                      │ mmap (daemon)
                                                                      ▼
                      Player (1× canvas, frame k) ─▶ Target (one per output) ─u32 fill of dirty rects─▶ wl_shm buffer
@@ -55,29 +55,29 @@ file ─(child: image crate)─▶ pixel-art detect ─▶ 1× frames ─▶ til
 ## 4. CLI
 | Command | Action |
 |---|---|
-| `pixelwp daemon` | Start the daemon in the foreground. If a daemon already runs: print a message, exit 0. |
-| `pixelwp img <path> [--output <name\|all>] [--fx <name>] [--anchor <name>]` | Set the wallpaper. Default `all`. `--fx`: see §9a. `--anchor`: see §8. |
-| `pixelwp clear [--color <hex>] [--output ...] [--fx ...]` | Solid colour. Default `000000`. |
-| `pixelwp query` | One line per output: `<name> <w>x<h> <file\|color #RRGGBB> <state> [<anchor>]`. The anchor is shown only when it is not `center`. |
-| `pixelwp still <file.png> [--output <name>]` | Write frame 0 of one output as a PNG. Default: the largest output. The client does this: it reads `query` and the cache file. An image has the output size and the integer scale; a colour is 1×1. |
-| `pixelwp pause` / `resume` | Manual pause. |
-| `pixelwp kill` | Stop the daemon. |
+| `waypixel daemon` | Start the daemon in the foreground. If a daemon already runs: print a message, exit 0. |
+| `waypixel img <path> [--output <name\|all>] [--fx <name>] [--anchor <name>]` | Set the wallpaper. Default `all`. `--fx`: see §9a. `--anchor`: see §8. |
+| `waypixel clear [--color <hex>] [--output ...] [--fx ...]` | Solid colour. Default `000000`. |
+| `waypixel query` | One line per output: `<name> <w>x<h> <file\|color #RRGGBB> <state> [<anchor>]`. The anchor is shown only when it is not `center`. |
+| `waypixel still <file.png> [--output <name>]` | Write frame 0 of one output as a PNG. Default: the largest output. The client does this: it reads `query` and the cache file. An image has the output size and the integer scale; a colour is 1×1. |
+| `waypixel pause` / `resume` | Manual pause. |
+| `waypixel kill` | Stop the daemon. |
 
 - `<name>` is the `wl_output` name, for example `DP-1`.
 - `<state>` is one of `playing`, `hidden`, `paused` or `static`.
 - Exit codes: 0 = ok, 1 = error, 2 = usage error, 3 = daemon not running.
 - The argument parser is hand-written. There is no clap.
-- To select a file from a directory, use a shell tool: `pixelwp img "$(fzf)"`.
+- To select a file from a directory, use a shell tool: `waypixel img "$(fzf)"`.
 
 ## 5. IPC
-- Socket: `$XDG_RUNTIME_DIR/pixelwp-<WAYLAND_DISPLAY basename>.sock`, mode 0600.
+- Socket: `$XDG_RUNTIME_DIR/waypixel-<WAYLAND_DISPLAY basename>.sock`, mode 0600.
 - One connection carries one request and one reply. Both are plain text.
 - Request: the arguments, each ended by a NUL byte, for example `img\0/a b.gif\0all\0config\0center\0`. The arguments after the target are the transition name (or `config`) and the anchor. The client then shuts down its write side.
 - Reply: the first line is `ok` or `error <text>`. For `query`, the output lines of §4 follow `ok`. The daemon formats them; the client prints them unchanged.
 - An `img` reply waits until the file is decoded or found in the cache, and the first frame is committed. The daemon holds the connection open and replies when the decode child exits.
 
 ## 6. Decode (child) and pixel-art detection
-1. Hash the file bytes with SHA-256 (`sha2`). The daemon does this before it starts the child. If a valid `<hash>.pwp` exists, the child is not started.
+1. Hash the file bytes with SHA-256 (`sha2`). The daemon does this before it starts the child. If a valid `<hash>.wpx` exists, the child is not started.
 2. Decode with `image` 0.25 (features gif, png, jpeg, webp).
    - GIF, APNG and animated WebP give composited full-canvas RGBA frames.
    - Still images apply the EXIF orientation.
@@ -97,10 +97,10 @@ file ─(child: image crate)─▶ pixel-art detect ─▶ 1× frames ─▶ til
 7. Compress each rect, as tightly packed u32 rows, with `lz4_flex` block compression.
 8. Write a temp file, `fsync` it, then `rename` it to the final name. On error, write one line to stderr and exit 1. The daemon puts that text in the reply.
 
-## 7. Cache file `.pwp`
-Path: `$XDG_CACHE_HOME/pixelwp/<sha256-hex>.pwp`. All values are little-endian.
+## 7. Cache file `.wpx`
+Path: `$XDG_CACHE_HOME/waypixel/<sha256-hex>.wpx`. All values are little-endian.
 ```
-Header (32 B): u32 magic 'PXWP', u16 version 3, u16 flags (0),
+Header (32 B): u32 magic 'WPXL', u16 version 3, u16 flags (0),
                u32 width, u32 height   (stored size: 1×)
                u32 frameCount, u32 reserved (0), u64 indexOffset
 Payload: LZ4 blocks, 16-byte aligned
@@ -116,7 +116,7 @@ Index (frameCount entries): u32 delayMs, u32 rectCount,
 - Code generation: `waybackend` + `waybackend-scanner`. Copy `daemon/build.rs`, `daemon/src/wayland.rs` and `protocols/wlr-layer-shell-unstable-v1.xml` from pixelawww.
 - **Per output:**
   - A `wl_surface` with an empty input region.
-  - A layer surface on the `background` layer, anchored to all four edges, exclusive zone -1, no keyboard focus, namespace `pixelwp`.
+  - A layer surface on the `background` layer, anchored to all four edges, exclusive zone -1, no keyboard focus, namespace `waypixel`.
   - A `wp_viewport`, and a fractional-scale object when the global exists.
 - **Scale:**
   - Fractional scale (n/120) has priority over `wl_output.scale`.
@@ -164,7 +164,7 @@ The fill is fast, so the dirty rects do not save much daemon CPU. Their purpose 
 ## 9a. Transitions
 `img` and `clear` show the change with a transition. The transitions are effects of ttfx, changed from terminal symbols to pixel-art cells. A restore at daemon start has no transition.
 
-- **Selection:** `--fx <burn|sweep|slide|wipe|disabled>`. Without `--fx`, the daemon reads the key `transition = <name>` from `$XDG_CONFIG_HOME/pixelwp/config` at each request. The default is `burn`. A bad value gives a log line and `burn`. Lines without `=` and text after `#` are ignored.
+- **Selection:** `--fx <burn|sweep|slide|wipe|disabled>`. Without `--fx`, the daemon reads the key `transition = <name>` from `$XDG_CONFIG_HOME/waypixel/config` at each request. The default is `burn`. A bad value gives a log line and `burn`. Lines without `=` and text after `#` are ignored.
 - **Sweep:** a shimmer of random greys goes from right to left in 40 steps (`in_out_quad`) and leaves the old wallpaper in grey. Then a shimmer of random colours (`8A008A` … `FFFFFF`) goes from left to right and leaves the new wallpaper. A cell shimmers for 4 steps.
 - **Slide:** bands of 6 rows. Band b starts at step b + 1 and moves for 24 steps (`in_out_quad`): the new wallpaper comes in from the left.
 - **Wipe:** the diagonals start from the top left to the bottom right in 50 steps (`in_out_quad`). A cell shows the colours `833AB4` … `FCB045` for 4 steps, then the new wallpaper.
@@ -193,12 +193,12 @@ There is no pause timer. Two rules apply:
 When no player has a deadline, the timer is disarmed. The current frame stays on screen. The buffers stay valid, so no full render is necessary on resume.
 
 ## 11. State and start at login
-- **State:** `$XDG_STATE_HOME/pixelwp/state`, one line per target: `<name|all> img <anchor> <path>` or `<name|all> color <hex>`. A line without an anchor (the path starts with `/`) has the anchor `center`.
+- **State:** `$XDG_STATE_HOME/waypixel/state`, one line per target: `<name|all> img <anchor> <path>` or `<name|all> color <hex>`. A line without an anchor (the path starts with `/`) has the anchor `center`.
   - It is written with a temp file + rename on each change, and read at daemon start.
   - A new output uses its own line, or else the `all` line.
-- **Start at login:** the repo contains `pixelwp.service`, a systemd user unit. The README tells the user how to copy and enable it. Its settings:
+- **Start at login:** the repo contains `waypixel.service`, a systemd user unit. The README tells the user how to copy and enable it. Its settings:
   - `Type=simple`.
-  - `ExecStart=%h/.cargo/bin/pixelwp daemon`.
+  - `ExecStart=%h/.cargo/bin/waypixel daemon`.
   - `Restart=on-failure`.
   - `PartOf=` and `After=graphical-session.target`.
   - `WantedBy=graphical-session.target`.
@@ -211,8 +211,8 @@ When no player has a deadline, the timer is disarmed. The current frame stays on
 
 ## 13. Source layout and dependencies
 ```
-~/git/pixelwp/
-  Cargo.toml  build.rs  SPEC.md  README.md  pixelwp.service
+~/git/waypixel/
+  Cargo.toml  build.rs  SPEC.md  README.md  waypixel.service
   protocols/wlr-layer-shell-unstable-v1.xml
   src/main.rs        CLI parse, dispatch, exit codes
   src/client.rs      socket client
@@ -220,7 +220,7 @@ When no player has a deadline, the timer is disarmed. The current frame stays on
   src/decode.rs      child: image → XRGB → pixelart → diff → cache write
   src/pixelart.rs    factor / holds / shrink / integer_scale (port of pixelawww)
   src/diff.rs        tile diff, rect merge
-  src/cache.rs       .pwp writer/reader, validation, cleanup
+  src/cache.rs       .wpx writer/reader, validation, cleanup
   src/scale.rs       upscale_rect (u32 fill)
   src/fx.rs          transitions: cell grid, burn, sweep, slide, wipe, render
   src/daemon/mod.rs      poll loop, IPC server, state file, signals
@@ -237,12 +237,12 @@ When no player has a deadline, the timer is disarmed. The current frame stays on
 ## 14. Implementation plan
 Each phase ends with passing `cargo test` and `cargo clippy`.
 
-1. **Scaffold.** `cargo new ~/git/pixelwp`, copy the protocol XML and build.rs, get the generated bindings to compile, and implement the CLI parser and exit codes.
+1. **Scaffold.** `cargo new ~/git/waypixel`, copy the protocol XML and build.rs, get the generated bindings to compile, and implement the CLI parser and exit codes.
 2. **Core algorithms (pure, unit-tested).**
    - `pixelart.rs`: port it to `u32` and keep all its tests.
    - `scale.rs`: `upscale_rect`.
    - `diff.rs`: tiles, merge to 8 or fewer rects, the 50 % rule.
-3. **Cache + decode child.** Write and read `.pwp`, decode, validate, clean up. The `pixelwp decode` subcommand.
+3. **Cache + decode child.** Write and read `.wpx`, decode, validate, clean up. The `waypixel decode` subcommand.
 4. **Daemon skeleton.**
    - Poll loop with signalfd, timerfd and the IPC server.
    - Wayland globals, outputs and layer surfaces.
@@ -251,7 +251,7 @@ Each phase ends with passing `cargo test` and `cargo clippy`.
 5. **Static images.** Start the child, wait on its pidfd, mmap the cache. Pixel-art Target with a full upscale. Buffer release and munmap when idle.
 6. **Animation.** Player canvas, ring, timer. Target dirty sets, per-rect damage, buffer age.
 7. **Pause and output changes.** The frame callback rule; a new Target on scale, size or output change; per-output state file and restore at start.
-8. **Docs.** README and `pixelwp.service`.
+8. **Docs.** README and `waypixel.service`.
 
 ## 15. Verification
 - **Unit tests:**
@@ -263,11 +263,11 @@ Each phase ends with passing `cargo test` and `cargo clippy`.
   - **Cache:** bad magic, bad version and a truncated file are rejected. Delay clamp; identical-frame merge. An image that is not pixel art is rejected. Art stored at 1× is accepted.
 - **Integration (headless):**
   - Run `sway` with `WLR_BACKENDS=headless` and an output of 3840×2160, plus a second output at scale 1.5.
-  - Run `pixelwp daemon` and `pixelwp img fixture-4x.gif`.
+  - Run `waypixel daemon` and `waypixel img fixture-4x.gif`.
   - Capture with `grim`. Every k×k block must be uniform, and the image must match a reference render.
 - **Measurements:**
   - Fill: the time of a full 4K `upscale_rect` into a real shm buffer that the compositor reads.
-  - RSS: `grep Rss /proc/$(pidof pixelwp)/smaps_rollup`.
+  - RSS: `grep Rss /proc/$(pidof waypixel)/smaps_rollup`.
   - CPU: `pidstat -p <pid> 1`.
   - Wakeups while paused: `perf stat -e 'syscalls:sys_enter_*'` or `strace -c`.
   - The results must meet the targets in §2. Compare with pixelawww on the same GIF.

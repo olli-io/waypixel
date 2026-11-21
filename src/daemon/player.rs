@@ -155,7 +155,7 @@ mod tests {
         let (w, h) = (40, 24);
         let frames = synthetic(w, h, frame_count, 100 + frame_count as u64);
         let path = temp(&format!(
-            "age-{frame_count}-{nbufs}-{:p}.pwp",
+            "age-{frame_count}-{nbufs}-{:p}.wpx",
             &shown as *const _
         ));
         write(&path, &frames, w, h, 50);
@@ -214,7 +214,7 @@ mod tests {
     fn dirty_sets() {
         let (w, h) = (40, 24);
         let frames = synthetic(w, h, 3, 55);
-        let path = temp("dirty.pwp");
+        let path = temp("dirty.wpx");
         write(&path, &frames, w, h, 50);
         let mut player = Player::new(1, [0; 32], Cache::open(&path).unwrap()).unwrap();
         let count = |p: &Player, since| {

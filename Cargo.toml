@@ -1,5 +1,5 @@
 [package]
-name = "pixelwp"
+name = "waypixel"
 version = "0.1.0"
 edition = "2024"
 description = "Minimal animated pixel-art wallpaper daemon for wlroots-type Wayland compositors"

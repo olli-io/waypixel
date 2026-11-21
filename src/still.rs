@@ -1,4 +1,4 @@
-//! `pixelwp still`: writes the wallpaper of one output as a PNG.
+//! `waypixel still`: writes the wallpaper of one output as a PNG.
 //!
 //! A session lock hides the wallpaper surface. A lock screen can show this file.
 //! Pixel art is written at the size of the output, with the integer scale of
@@ -111,7 +111,7 @@ pub fn run(dst: &Path, output: Option<&str>) -> i32 {
     match result {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("pixelwp: {e}");
+            eprintln!("waypixel: {e}");
             1
         }
     }

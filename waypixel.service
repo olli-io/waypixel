@@ -1,11 +1,11 @@
 [Unit]
-Description=pixelwp wallpaper daemon
+Description=waypixel wallpaper daemon
 PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.cargo/bin/pixelwp daemon
+ExecStart=%h/.cargo/bin/waypixel daemon
 Restart=on-failure
 
 [Install]

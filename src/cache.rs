@@ -1,8 +1,8 @@
-//! The `.pwp` cache file: writer (decode child), reader (daemon), cleanup.
+//! The `.wpx` cache file: writer (decode child), reader (daemon), cleanup.
 //!
 //! All values are little-endian.
 //! ```text
-//! Header (32 B): u32 magic 'PXWP', u16 version, u16 flags (0),
+//! Header (32 B): u32 magic 'WPXL', u16 version, u16 flags (0),
 //!                u32 width, u32 height, u32 frameCount, u32 reserved, u64 indexOffset
 //! Payload: LZ4 blocks, 16-byte aligned
 //! Index (frameCount entries): u32 delayMs, u32 rectCount,
@@ -18,9 +18,9 @@ use sha2::{Digest, Sha256};
 use crate::diff::{MAX_RECTS, Rect};
 
 #[cfg(target_endian = "big")]
-compile_error!("pixelwp supports little-endian targets only");
+compile_error!("waypixel supports little-endian targets only");
 
-const MAGIC: [u8; 4] = *b"PXWP";
+const MAGIC: [u8; 4] = *b"WPXL";
 const VERSION: u16 = 3;
 const HEADER: usize = 32;
 const ALIGN: u64 = 16;
@@ -39,9 +39,9 @@ pub fn bytes_mut(v: &mut [u32]) -> &mut [u8] {
     unsafe { core::slice::from_raw_parts_mut(v.as_mut_ptr().cast(), size_of_val(v)) }
 }
 
-/// `$XDG_CACHE_HOME/pixelwp`
+/// `$XDG_CACHE_HOME/waypixel`
 pub fn dir() -> PathBuf {
-    crate::ipc::xdg_dir("XDG_CACHE_HOME", ".cache").join("pixelwp")
+    crate::ipc::xdg_dir("XDG_CACHE_HOME", ".cache").join("waypixel")
 }
 
 pub fn hex(hash: &Hash) -> String {
@@ -49,7 +49,7 @@ pub fn hex(hash: &Hash) -> String {
 }
 
 pub fn path_for(hash: &Hash) -> PathBuf {
-    dir().join(format!("{}.pwp", hex(hash)))
+    dir().join(format!("{}.wpx", hex(hash)))
 }
 
 /// SHA-256 of the file bytes.
@@ -443,7 +443,7 @@ pub mod tests {
     use crate::pixelart::tests::Rng;
 
     pub fn temp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pixelwp-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("waypixel-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }
@@ -488,7 +488,7 @@ pub mod tests {
     fn round_trip_is_bit_exact() {
         for (w, h, seed) in [(64, 40, 1), (37, 23, 2), (8, 8, 3), (130, 3, 4)] {
             let frames = synthetic(w, h, 12, seed);
-            let path = temp(&format!("rt-{seed}.pwp"));
+            let path = temp(&format!("rt-{seed}.wpx"));
             write(&path, &frames, w, h, 50);
             let cache = Cache::open(&path).unwrap();
             assert_eq!((cache.w as usize, cache.h as usize), (w, h));
@@ -512,7 +512,7 @@ pub mod tests {
         let a = vec![1u32; 16 * 16];
         let mut b = a.clone();
         b[5] = 2;
-        let path = temp("merge.pwp");
+        let path = temp("merge.wpx");
         write(&path, &[a.clone(), a.clone(), b.clone(), b], 16, 16, 30);
         let cache = Cache::open(&path).unwrap();
         assert_eq!(cache.frame_count(), 2);
@@ -523,7 +523,7 @@ pub mod tests {
     #[test]
     fn bad_files_are_rejected() {
         let frames = synthetic(32, 32, 4, 9);
-        let path = temp("bad.pwp");
+        let path = temp("bad.wpx");
         write(&path, &frames, 32, 32, 50);
         let good = std::fs::read(&path).unwrap();
         assert!(Cache::open(&path).is_ok());

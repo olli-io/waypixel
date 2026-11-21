@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use rustix::fd::OwnedFd;
 
-const BIN: &str = env!("CARGO_BIN_EXE_pixelwp");
+const BIN: &str = env!("CARGO_BIN_EXE_waypixel");
 
 // ---- mock compositor ----------------------------------------------------------
 
@@ -449,7 +449,7 @@ impl Mock {
                 let output = m.u32();
                 let layer = m.u32();
                 let namespace = m.string();
-                if layer != 0 || namespace != "pixelwp" {
+                if layer != 0 || namespace != "waypixel" {
                     self.error(format!("layer {layer}, namespace {namespace}"));
                 }
                 let index = self
@@ -605,7 +605,7 @@ struct Env {
 impl Env {
     fn new(name: &str, outputs: Vec<OutputCfg>) -> Self {
         // a short path: a socket path has a limit of 108 bytes
-        let dir = PathBuf::from(format!("/tmp/pwp-{}-{name}", std::process::id()));
+        let dir = PathBuf::from(format!("/tmp/wpx-{}-{name}", std::process::id()));
         _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("rt")).unwrap();
         let listener = UnixListener::bind(dir.join("rt/wayland-test")).unwrap();
@@ -646,7 +646,7 @@ impl Env {
 
     fn start_daemon(&mut self) {
         self.daemon = Some(self.command().arg("daemon").spawn().unwrap());
-        let socket = self.dir.join("rt/pixelwp-wayland-test.sock");
+        let socket = self.dir.join("rt/waypixel-wayland-test.sock");
         wait("the daemon socket", || UnixStream::connect(&socket).is_ok());
     }
 
@@ -703,7 +703,7 @@ impl Env {
     }
 
     fn cache_files(&self) -> Vec<String> {
-        let Ok(dir) = std::fs::read_dir(self.dir.join("cache/pixelwp")) else {
+        let Ok(dir) = std::fs::read_dir(self.dir.join("cache/waypixel")) else {
             return Vec::new();
         };
         dir.flatten()
@@ -899,7 +899,7 @@ fn full_session() {
             .starts_with("DP-1 400x225 color #FF8800 static\n")
     );
     let (code, _, stderr) = env.cli(&["clear", "--output", "DP-9"]);
-    assert_eq!((code, stderr.trim()), (1, "pixelwp: unknown output DP-9"));
+    assert_eq!((code, stderr.trim()), (1, "waypixel: unknown output DP-9"));
 
     // -- pixel-art animation on all outputs
     let (w, h) = (64, 36);
@@ -1075,7 +1075,7 @@ fn full_session() {
         env.ok(&["query"])
             .ends_with(&format!("{png} static bottomright\n"))
     );
-    let state = std::fs::read_to_string(env.dir.join("state/pixelwp/state")).unwrap();
+    let state = std::fs::read_to_string(env.dir.join("state/waypixel/state")).unwrap();
     assert!(state.ends_with(&format!("HDMI-A-1 img bottomright {png}\n")));
     env.ok(&["img", png, "-o", "HDMI-A-1"]);
     assert_eq!(
@@ -1106,11 +1106,11 @@ fn full_session() {
     let (code, _, stderr) = env.cli(&["img", photo_path.to_str().unwrap(), "-o", "HDMI-A-1"]);
     assert_eq!(
         (code, stderr.trim()),
-        (1, "pixelwp: the image is not true pixel art")
+        (1, "waypixel: the image is not true pixel art")
     );
     assert_eq!(
         std::fs::read_to_string(env.dir.join("notified")).unwrap(),
-        "--app-name=pixelwp\npixelwp\nphoto.png: the image is not true pixel art\n"
+        "--app-name=waypixel\nwaypixel\nphoto.png: the image is not true pixel art\n"
     );
     std::fs::remove_file(env.dir.join("notified")).unwrap();
     env.ok(&["img", png, "-o", "HDMI-A-1"]);
@@ -1122,7 +1122,7 @@ fn full_session() {
     std::fs::write(&txt, "this is not an image").unwrap();
     let (code, _, stderr) = env.cli(&["img", txt.to_str().unwrap()]);
     assert_eq!(code, 1);
-    assert!(stderr.starts_with("pixelwp: "), "{stderr}");
+    assert!(stderr.starts_with("waypixel: "), "{stderr}");
     let (code, _, _) = env.cli(&["img", "/nonexistent/file.gif"]);
     assert_eq!(code, 1);
     let noise = env.dir.join("noise.gif");
@@ -1136,7 +1136,7 @@ fn full_session() {
     let (code, _, stderr) = env.cli(&["img", noise.to_str().unwrap()]);
     assert_eq!(
         (code, stderr.trim()),
-        (1, "pixelwp: the image is not true pixel art")
+        (1, "waypixel: the image is not true pixel art")
     );
     assert!(env.dir.join("notified").exists());
     assert_eq!(
@@ -1147,21 +1147,20 @@ fn full_session() {
 
     // -- kill; the state comes back at the next start
     env.assert_no_errors();
-    let state = std::fs::read_to_string(env.dir.join("state/pixelwp/state")).unwrap();
+    let state = std::fs::read_to_string(env.dir.join("state/waypixel/state")).unwrap();
     assert_eq!(
         state,
         format!("all img center {gif}\nHDMI-A-1 img center {png}\n")
     );
     env.ok(&["kill"]);
     assert_eq!(env.daemon.take().unwrap().wait().unwrap().code(), Some(0));
-    assert!(!env.dir.join("rt/pixelwp-wayland-test.sock").exists());
+    assert!(!env.dir.join("rt/waypixel-wayland-test.sock").exists());
     assert_eq!(env.cli(&["query"]).0, 3);
 
     env.mock().outputs[0].logical = (400, 225);
     env.start_daemon();
     wait("restore", || {
-        env.ok(&["query"])
-            == format!("DP-1 400x225 {gif} playing\nHDMI-A-1 384x216 {png} static\n")
+        env.ok(&["query"]) == format!("DP-1 400x225 {gif} playing\nHDMI-A-1 384x216 {png} static\n")
     });
     wait("restored frames", || {
         env.mock()
@@ -1184,7 +1183,7 @@ fn full_session() {
         .status()
         .unwrap();
     assert_eq!(env.daemon.take().unwrap().wait().unwrap().code(), Some(0));
-    assert!(!env.dir.join("rt/pixelwp-wayland-test.sock").exists());
+    assert!(!env.dir.join("rt/waypixel-wayland-test.sock").exists());
 }
 
 /// SPEC §2 targets on a 4K output. Only the daemon is measured; the mock
@@ -1283,9 +1282,9 @@ fn burn_transition() {
     write_gif(&gif, &frames, w, h, 4, 50);
     let start = Instant::now();
     // the transition comes from the config file
-    std::fs::create_dir_all(env.dir.join("config/pixelwp")).unwrap();
+    std::fs::create_dir_all(env.dir.join("config/waypixel")).unwrap();
     std::fs::write(
-        env.dir.join("config/pixelwp/config"),
+        env.dir.join("config/waypixel/config"),
         "transition = slide\n",
     )
     .unwrap();
@@ -1350,7 +1349,7 @@ fn burn_transition() {
 
     // `disabled` in the config file: the reply comes with the final pixels
     std::fs::write(
-        env.dir.join("config/pixelwp/config"),
+        env.dir.join("config/waypixel/config"),
         "transition = disabled\n",
     )
     .unwrap();

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds pixelwp, copies the binary to a bin directory, and adds the systemd
+# Builds waypixel, copies the binary to a bin directory, and adds the systemd
 # user unit that starts the daemon at login.
 #
 # Usage: ./install.sh
@@ -13,15 +13,15 @@ UNITDIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 cargo build --release --locked
 
 # `install` replaces the file, so this also works while the daemon runs
-install -Dm755 target/release/pixelwp "$BINDIR/pixelwp"
-echo "installed $BINDIR/pixelwp"
+install -Dm755 target/release/waypixel "$BINDIR/waypixel"
+echo "installed $BINDIR/waypixel"
 
 mkdir -p "$UNITDIR"
-sed "s|^ExecStart=.*|ExecStart=$BINDIR/pixelwp daemon|" pixelwp.service > "$UNITDIR/pixelwp.service"
-echo "installed $UNITDIR/pixelwp.service"
+sed "s|^ExecStart=.*|ExecStart=$BINDIR/waypixel daemon|" waypixel.service > "$UNITDIR/waypixel.service"
+echo "installed $UNITDIR/waypixel.service"
 
 systemctl --user daemon-reload
-systemctl --user enable pixelwp.service
+systemctl --user enable waypixel.service
 # restart: a daemon that runs gets the new binary
-systemctl --user restart pixelwp.service
-echo "pixelwp.service is enabled and started"
+systemctl --user restart waypixel.service
+echo "waypixel.service is enabled and started"

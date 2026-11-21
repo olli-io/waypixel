@@ -1,6 +1,6 @@
 //! Decode child: image → XRGB → pixel-art detection → tile diff → cache file.
 //!
-//! This runs in a separate process (`pixelwp decode <src> <dst>`), so all decode
+//! This runs in a separate process (`waypixel decode <src> <dst>`), so all decode
 //! memory goes away at exit.
 
 use std::fs::File;
@@ -267,18 +267,23 @@ pub mod tests {
             let big: Vec<(Vec<u32>, u32)> =
                 art.iter().map(|f| (scaled(f, w, h, n).0, 70)).collect();
             let gif = temp(&format!("rt-{seed}.gif"));
-            let pwp = temp(&format!("rt-{seed}-gif.pwp"));
+            let wpx = temp(&format!("rt-{seed}-gif.wpx"));
             write_gif(&gif, &big, (w * n) as u32, (h * n) as u32);
-            run(&gif, &pwp).unwrap();
-            let cache = Cache::open(&pwp).unwrap();
-                assert_eq!((cache.w as usize, cache.h as usize), (w, h));
+            run(&gif, &wpx).unwrap();
+            let cache = Cache::open(&wpx).unwrap();
+            assert_eq!((cache.w as usize, cache.h as usize), (w, h));
             assert_eq!(replay(&cache), art);
             assert!((0..cache.frame_count()).all(|i| cache.delay_ms(i) == 70));
             // no temp file stays
-            let leftovers = std::fs::read_dir(pwp.parent().unwrap())
+            let leftovers = std::fs::read_dir(wpx.parent().unwrap())
                 .unwrap()
                 .flatten()
-                .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+                // other tests write their temp files to the same directory
+                .filter(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with(&format!("rt-{seed}-gif")) && name.contains(".tmp.")
+                })
                 .count();
             assert_eq!(leftovers, 0);
         }
@@ -295,10 +300,10 @@ pub mod tests {
             }
         }
         let gif = temp("restart.gif");
-        let pwp = temp("restart.pwp");
+        let wpx = temp("restart.wpx");
         write_gif(&gif, &[(f0.clone(), 100), (f1.clone(), 100)], w, h);
-        run(&gif, &pwp).unwrap();
-        let cache = Cache::open(&pwp).unwrap();
+        run(&gif, &wpx).unwrap();
+        let cache = Cache::open(&wpx).unwrap();
         assert_eq!((cache.w, cache.h), (w / 2, h / 2));
         assert_eq!(cache.frame_count(), 2);
         let frames = replay(&cache);
@@ -313,11 +318,11 @@ pub mod tests {
         b[..2].fill(0xFF00_FF00);
         b[w as usize..w as usize + 2].fill(0xFF00_FF00);
         let gif = temp("delay.gif");
-        let pwp = temp("delay.pwp");
+        let wpx = temp("delay.wpx");
         // 10 ms is under the limit and becomes 100 ms; the two `b` frames merge
         write_gif(&gif, &[(a, 10), (b.clone(), 40), (b, 50)], w, h);
-        run(&gif, &pwp).unwrap();
-        let cache = Cache::open(&pwp).unwrap();
+        run(&gif, &wpx).unwrap();
+        let cache = Cache::open(&wpx).unwrap();
         assert_eq!(cache.frame_count(), 2);
         assert_eq!((cache.delay_ms(0), cache.delay_ms(1)), (100, 90));
     }
@@ -328,19 +333,19 @@ pub mod tests {
         let f0: Vec<u32> = (0..200).map(|i| 0xFF00_0000 | i).collect();
         let f1: Vec<u32> = (0..200).map(|i| 0xFF00_8000 | i).collect();
         let gif = temp("colours.gif");
-        let pwp = temp("colours.pwp");
+        let wpx = temp("colours.wpx");
         write_gif(&gif, &[(f0, 100), (f1, 100)], 20, 10);
-        assert_eq!(run(&gif, &pwp).err().unwrap(), NOT_PIXEL_ART);
-        assert!(!pwp.exists());
+        assert_eq!(run(&gif, &wpx).err().unwrap(), NOT_PIXEL_ART);
+        assert!(!wpx.exists());
 
         // too large for art stored at 1×
         let w = MAX_1X_SIDE + 1;
         let f0 = art_frames(w as usize, 3, 2, 5);
         let gif = temp("large.gif");
-        let pwp = temp("large.pwp");
+        let wpx = temp("large.wpx");
         write_gif(&gif, &[(f0[0].clone(), 100), (f0[1].clone(), 100)], w, 3);
-        assert_eq!(run(&gif, &pwp).err().unwrap(), NOT_PIXEL_ART);
-        assert!(!pwp.exists());
+        assert_eq!(run(&gif, &wpx).err().unwrap(), NOT_PIXEL_ART);
+        assert!(!wpx.exists());
     }
 
     /// Art stored at 1× (N = 1): small, with few colours.
@@ -350,18 +355,18 @@ pub mod tests {
         let art = art_frames(w, h, 6, 21);
         let frames: Vec<(Vec<u32>, u32)> = art.iter().map(|f| (f.clone(), 80)).collect();
         let gif = temp("1x.gif");
-        let pwp = temp("1x-gif.pwp");
+        let wpx = temp("1x-gif.wpx");
         write_gif(&gif, &frames, w as u32, h as u32);
-        run(&gif, &pwp).unwrap();
-        let cache = Cache::open(&pwp).unwrap();
+        run(&gif, &wpx).unwrap();
+        let cache = Cache::open(&wpx).unwrap();
         assert_eq!((cache.w as usize, cache.h as usize), (w, h));
         assert_eq!(replay(&cache), art);
 
         let png = temp("1x.png");
-        let pwp = temp("1x-png.pwp");
+        let wpx = temp("1x-png.wpx");
         to_rgba(&art[0], w as u32, h as u32).save(&png).unwrap();
-        run(&png, &pwp).unwrap();
-        let cache = Cache::open(&pwp).unwrap();
+        run(&png, &wpx).unwrap();
+        let cache = Cache::open(&wpx).unwrap();
         assert_eq!(replay(&cache)[0], art[0]);
     }
 
@@ -370,10 +375,10 @@ pub mod tests {
         // pixel-art PNG: stored at 1×
         let (v, w, h) = scaled(&checker(6, 5), 6, 5, 8);
         let png = temp("art.png");
-        let pwp = temp("art.pwp");
+        let wpx = temp("art.wpx");
         to_rgba(&v, w, h).save(&png).unwrap();
-        run(&png, &pwp).unwrap();
-        let cache = Cache::open(&pwp).unwrap();
+        run(&png, &wpx).unwrap();
+        let cache = Cache::open(&wpx).unwrap();
         assert_eq!((cache.w, cache.h, cache.frame_count()), (6, 5, 1));
         assert_eq!(replay(&cache)[0], checker(6, 5));
 
@@ -383,10 +388,10 @@ pub mod tests {
             .map(|_| 0xFF00_0000 | rng.next() >> 8)
             .collect();
         let png = temp("photo.png");
-        let pwp = temp("photo.pwp");
+        let wpx = temp("photo.wpx");
         to_rgba(&v, 31, 17).save(&png).unwrap();
-        assert_eq!(run(&png, &pwp).err().unwrap(), NOT_PIXEL_ART);
-        assert!(!pwp.exists());
+        assert_eq!(run(&png, &wpx).err().unwrap(), NOT_PIXEL_ART);
+        assert!(!wpx.exists());
     }
 
     #[test]
@@ -400,7 +405,7 @@ pub mod tests {
     fn bad_input_is_an_error() {
         let txt = temp("not-an-image.txt");
         std::fs::write(&txt, "hello").unwrap();
-        assert!(run(&txt, &temp("x.pwp")).is_err());
-        assert!(run(Path::new("/nonexistent.gif"), &temp("y.pwp")).is_err());
+        assert!(run(&txt, &temp("x.wpx")).is_err());
+        assert!(run(Path::new("/nonexistent.gif"), &temp("y.wpx")).is_err());
     }
 }

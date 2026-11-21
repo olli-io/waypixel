@@ -36,7 +36,7 @@ impl Pool {
         if len == 0 || len > i32::MAX as usize {
             return Err(io::Errno::INVAL);
         }
-        let fd = memfd_create(c"pixelwp", MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING)?;
+        let fd = memfd_create(c"waypixel", MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING)?;
         ftruncate(&fd, len as u64)?;
         // The seal lets the compositor skip its SIGBUS protection. An error is not important.
         _ = fcntl_add_seals(&fd, SealFlags::SHRINK | SealFlags::SEAL);

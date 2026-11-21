@@ -118,7 +118,7 @@ struct State {
 
 impl State {
     fn load() -> Self {
-        let path = ipc::xdg_dir("XDG_STATE_HOME", ".local/state").join("pixelwp/state");
+        let path = ipc::xdg_dir("XDG_STATE_HOME", ".local/state").join("waypixel/state");
         let text = std::fs::read_to_string(&path).unwrap_or_default();
         Self {
             entries: Self::parse(&text),
@@ -188,7 +188,7 @@ impl State {
             std::fs::rename(&tmp, &self.path)
         };
         if let Err(e) = write() {
-            eprintln!("pixelwp: cannot write {}: {e}", self.path.display());
+            eprintln!("waypixel: cannot write {}: {e}", self.path.display());
         }
     }
 
@@ -215,16 +215,16 @@ impl State {
 // ---- daemon -----------------------------------------------------------------
 
 /// The transition of a request. `config` is the `transition` key of
-/// `$XDG_CONFIG_HOME/pixelwp/config`. The file is read for each request, so a
+/// `$XDG_CONFIG_HOME/waypixel/config`. The file is read for each request, so a
 /// change needs no restart. A bad file gives a log line and the default.
 fn transition(name: &str) -> Result<Option<Kind>, String> {
     if name != "config" {
         return Kind::parse(name).ok_or(format!("bad transition {name}"));
     }
-    let path = ipc::xdg_dir("XDG_CONFIG_HOME", ".config").join("pixelwp/config");
+    let path = ipc::xdg_dir("XDG_CONFIG_HOME", ".config").join("waypixel/config");
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     Ok(Kind::from_config(&text).unwrap_or_else(|e| {
-        eprintln!("pixelwp: {}: {e}", path.display());
+        eprintln!("waypixel: {}: {e}", path.display());
         Some(Kind::Burn)
     }))
 }
@@ -298,7 +298,7 @@ struct Daemon {
 impl Daemon {
     fn bind_output(&mut self, global: u32, version: u32) {
         if version < 4 {
-            eprintln!("pixelwp: wl_output must be version 4 or higher");
+            eprintln!("waypixel: wl_output must be version 4 or higher");
             return;
         }
         let wl_output = self.wl.objman.create(Obj::Output);
@@ -497,7 +497,7 @@ impl Daemon {
                 hash: Some(hash),
                 anchor,
             }) => self.wall_for(&hash, &path, anchor).unwrap_or_else(|e| {
-                eprintln!("pixelwp: {path}: {e}");
+                eprintln!("waypixel: {path}: {e}");
                 Wall::Color(BLACK)
             }),
             _ => Wall::Color(BLACK),
@@ -518,7 +518,7 @@ impl Daemon {
             self.wake(index);
             return;
         };
-        eprintln!("pixelwp: {}: {e}", output.name);
+        eprintln!("waypixel: {}: {e}", output.name);
         // A cache file that became bad is decoded again.
         if let Wall::Still { hash, path, anchor } = &output.wall
             && Cache::open(&cache::path_for(hash)).is_err()
@@ -526,7 +526,7 @@ impl Daemon {
         {
             let (path, target, anchor) = (path.clone(), entry.target.clone(), *anchor);
             if let Err(e) = self.start_img(&path, anchor, &target, None, false, None) {
-                eprintln!("pixelwp: {e}");
+                eprintln!("waypixel: {e}");
             }
         }
     }
@@ -606,7 +606,7 @@ impl Daemon {
         let spawn = || -> std::io::Result<(Child, OwnedFd, File)> {
             // The child writes its error text to a memfd, so it cannot block on a full pipe.
             let memfd =
-                rustix::fs::memfd_create(c"pixelwp-decode", rustix::fs::MemfdFlags::CLOEXEC)?;
+                rustix::fs::memfd_create(c"waypixel-decode", rustix::fs::MemfdFlags::CLOEXEC)?;
             let stderr = File::from(memfd);
             // /proc/self/exe is this binary, also after a new version replaced the file
             let child = Command::new("/proc/self/exe")
@@ -703,7 +703,7 @@ impl Daemon {
             Some(id) => self.reply(id, result),
             None => {
                 if let Err(e) = result {
-                    eprintln!("pixelwp: {}: {e}", job.path);
+                    eprintln!("waypixel: {}: {e}", job.path);
                 }
             }
         }
@@ -961,7 +961,7 @@ impl Daemon {
 
 impl wayland::wl_display::EvHandler for Daemon {
     fn error(&mut self, _: ObjectId, object_id: ObjectId, code: u32, message: &str) {
-        eprintln!("pixelwp: Wayland protocol error: object {object_id}, code {code}: {message}");
+        eprintln!("waypixel: Wayland protocol error: object {object_id}, code {code}: {message}");
         self.exit = Some(1);
     }
 
@@ -1156,7 +1156,7 @@ pub fn run() -> i32 {
     match run_inner() {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("pixelwp: {e}");
+            eprintln!("waypixel: {e}");
             1
         }
     }
@@ -1165,7 +1165,7 @@ pub fn run() -> i32 {
 fn run_inner() -> Result<i32, String> {
     let socket_path = ipc::socket_path();
     if UnixStream::connect(&socket_path).is_ok() {
-        println!("pixelwp: the daemon is already running");
+        println!("waypixel: the daemon is already running");
         return Ok(0);
     }
 
@@ -1261,7 +1261,7 @@ fn run_inner() -> Result<i32, String> {
         .collect();
     for (target, path, anchor) in images {
         if let Err(e) = daemon.start_img(&path, anchor, &target, None, false, None) {
-            eprintln!("pixelwp: {e}");
+            eprintln!("waypixel: {e}");
         }
     }
     daemon.restoring = false;
@@ -1280,7 +1280,7 @@ fn run_inner() -> Result<i32, String> {
         daemon.arm_timer();
         let flushed = daemon.wl.flush();
         if let Some(e) = flushed.err().or(daemon.wl.error) {
-            eprintln!("pixelwp: the Wayland connection failed: {e}");
+            eprintln!("waypixel: the Wayland connection failed: {e}");
             break 1;
         }
         if let Some(code) = daemon.exit {
@@ -1362,7 +1362,7 @@ fn run_inner() -> Result<i32, String> {
             let mut msgs = match receiver.recv(daemon.wl.fd()) {
                 Ok(msgs) => msgs,
                 Err(e) => {
-                    eprintln!("pixelwp: cannot read from the compositor: {e}");
+                    eprintln!("waypixel: cannot read from the compositor: {e}");
                     break 1;
                 }
             };
@@ -1394,7 +1394,7 @@ fn run_inner() -> Result<i32, String> {
             }
             drop(msgs);
             if wayland_gone {
-                eprintln!("pixelwp: the compositor closed the connection");
+                eprintln!("waypixel: the compositor closed the connection");
                 break 1;
             }
             // Events come in batches, so one build for each changed output is sufficient.
