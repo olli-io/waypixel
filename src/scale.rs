@@ -3,6 +3,61 @@
 use crate::diff::Rect;
 use crate::pixelart::integer_scale;
 
+/// The part of an image that stays in view when a scale cuts the overflow.
+/// On each axis: 0 = the start, 1 = the centre, 2 = the end.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Anchor {
+    x: u8,
+    y: u8,
+}
+
+impl Default for Anchor {
+    fn default() -> Self {
+        Self { x: 1, y: 1 }
+    }
+}
+
+impl Anchor {
+    pub const NAMES: &str =
+        "center, top, bottom, left, right, topleft, topright, bottomleft or bottomright";
+
+    const TABLE: [(&str, u8, u8); 9] = [
+        ("center", 1, 1),
+        ("top", 1, 0),
+        ("bottom", 1, 2),
+        ("left", 0, 1),
+        ("right", 2, 1),
+        ("topleft", 0, 0),
+        ("topright", 2, 0),
+        ("bottomleft", 0, 2),
+        ("bottomright", 2, 2),
+    ];
+
+    /// Parses a name of `NAMES`. `top-left` and `top_left` are also correct.
+    pub fn parse(name: &str) -> Option<Self> {
+        let name = name.replace(['-', '_'], "");
+        Self::TABLE
+            .iter()
+            .find(|(n, ..)| *n == name)
+            .map(|&(_, x, y)| Self { x, y })
+    }
+
+    pub fn name(self) -> &'static str {
+        let found = Self::TABLE
+            .iter()
+            .find(|&&(_, x, y)| (x, y) == (self.x, self.y));
+        found.map_or("center", |(name, ..)| name)
+    }
+
+    /// The offset of the visible part for an overflow of (x, y).
+    pub fn offset(self, overflow: (u64, u64)) -> (u64, u64) {
+        (
+            overflow.0 * self.x as u64 / 2,
+            overflow.1 * self.y as u64 / 2,
+        )
+    }
+}
+
 /// How a 1× image maps to a screen buffer: screen pixel (x, y) shows art pixel
 /// ((x + ox) / k, (y + oy) / k).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -19,18 +74,19 @@ pub struct Geom {
 }
 
 impl Geom {
-    pub fn new(art: (u32, u32), screen: (u32, u32)) -> Self {
+    pub fn new(art: (u32, u32), screen: (u32, u32), anchor: Anchor) -> Self {
         let k = integer_scale(art, screen) as usize;
         let (w, h) = (art.0 as usize, art.1 as usize);
         let (sw, sh) = (screen.0 as usize, screen.1 as usize);
+        let (ox, oy) = anchor.offset(((k * w - sw) as u64, (k * h - sh) as u64));
         Self {
             w,
             h,
             sw,
             sh,
             k,
-            ox: (k * w - sw) / 2,
-            oy: (k * h - sh) / 2,
+            ox: ox as usize,
+            oy: oy as usize,
         }
     }
 
@@ -125,7 +181,7 @@ mod tests {
         };
         let mut rng = Rng(1);
         for (w, h) in [(320u32, 180u32), (640, 360)] {
-            let g = Geom::new((w, h), (sw as u32, sh as u32));
+            let g = Geom::new((w, h), (sw as u32, sh as u32), Anchor::default());
             let src: Vec<u32> = (0..w * h).map(|_| rng.next()).collect();
             let all = Rect::new(0, 0, w, h);
             upscale_rect(&src, dst, &g, all); // page faults
@@ -141,14 +197,32 @@ mod tests {
 
     #[test]
     fn geom_table() {
-        let g = Geom::new((7, 5), (30, 17));
-        assert_eq!((g.k, g.ox, g.oy), (5, 2, 4));
-        let g = Geom::new((8, 8), (4, 2));
-        assert_eq!((g.k, g.ox, g.oy), (1, 2, 3));
+        let at = |art, screen, anchor: &str| {
+            let g = Geom::new(art, screen, Anchor::parse(anchor).unwrap());
+            (g.k, g.ox, g.oy)
+        };
+        assert_eq!(at((7, 5), (30, 17), "center"), (5, 2, 4));
+        assert_eq!(at((8, 8), (4, 2), "center"), (1, 2, 3));
+        // the overflow is 5 × 8
+        assert_eq!(at((7, 5), (30, 17), "topleft"), (5, 0, 0));
+        assert_eq!(at((7, 5), (30, 17), "top"), (5, 2, 0));
+        assert_eq!(at((7, 5), (30, 17), "right"), (5, 5, 4));
+        assert_eq!(at((7, 5), (30, 17), "bottom-left"), (5, 0, 8));
+        assert_eq!(at((7, 5), (30, 17), "bottomright"), (5, 5, 8));
+    }
+
+    #[test]
+    fn anchor_names() {
+        for (name, ..) in Anchor::TABLE {
+            assert_eq!(Anchor::parse(name).unwrap().name(), name);
+        }
+        assert_eq!(Anchor::default().name(), "center");
+        assert_eq!(Anchor::parse("middle"), None);
     }
 
     #[test]
     fn full_frame_matches_reference() {
+        let anchors = Anchor::TABLE.map(|(_, x, y)| Anchor { x, y });
         let mut rng = Rng(7);
         for k in 1..=13usize {
             let (w, h) = (9 + rng.below(8), 7 + rng.below(8));
@@ -157,7 +231,7 @@ mod tests {
             let sh = (h * k as u32)
                 .saturating_sub(rng.below(3 * k as u32))
                 .max(1);
-            let g = Geom::new((w, h), (sw, sh));
+            let g = Geom::new((w, h), (sw, sh), anchors[rng.below(9) as usize]);
             assert_eq!(g.k, k);
             let src: Vec<u32> = (0..w * h).map(|_| rng.next()).collect();
             let mut dst = vec![0; g.sw * g.sh];
@@ -169,6 +243,7 @@ mod tests {
 
     #[test]
     fn dirty_rect_equals_full_render() {
+        let anchors = Anchor::TABLE.map(|(_, x, y)| Anchor { x, y });
         let mut rng = Rng(42);
         for k in 1..=13usize {
             for _ in 0..40 {
@@ -177,7 +252,7 @@ mod tests {
                 let sh = (h * k as u32)
                     .saturating_sub(rng.below(2 * k as u32))
                     .max(1);
-                let g = Geom::new((w, h), (sw, sh));
+                let g = Geom::new((w, h), (sw, sh), anchors[rng.below(9) as usize]);
                 let prev: Vec<u32> = (0..w * h).map(|_| rng.next()).collect();
                 let mut dst = full(&prev, &g);
 

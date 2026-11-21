@@ -9,7 +9,7 @@ use waybackend::types::ObjectId;
 use super::wayland::{Obj, Wl, req};
 
 /// A compositor that never releases buffers does not get more than this.
-const MAX_BUFFERS: usize = 3;
+pub const MAX_BUFFERS: usize = 3;
 
 pub struct Buf {
     pub id: ObjectId,

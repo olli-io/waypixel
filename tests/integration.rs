@@ -1063,6 +1063,23 @@ fn full_session() {
         env.ok(&["query"]),
         format!("DP-1 300x200 {gif} playing\nHDMI-A-1 384x216 {png} static\n")
     );
+    // an anchor moves the cut: 40×30 at k = 10 is 400×300, the overflow is 16×84
+    env.ok(&["img", png, "-o", "HDMI-A-1", "--anchor", "bottomright"]);
+    let want: Vec<u32> = (0..216 * 384)
+        .map(|i| art[(i / 384 + 84) / 10 * 40 + (i % 384 + 16) / 10])
+        .collect();
+    assert_eq!(env.texture(1), (want, phys[1]));
+    assert!(
+        env.ok(&["query"])
+            .ends_with(&format!("{png} static bottomright\n"))
+    );
+    let state = std::fs::read_to_string(env.dir.join("state/pixelwp/state")).unwrap();
+    assert!(state.ends_with(&format!("HDMI-A-1 img bottomright {png}\n")));
+    env.ok(&["img", png, "-o", "HDMI-A-1"]);
+    assert_eq!(
+        env.texture(1),
+        (reference(&art, (40, 30), phys[1]), phys[1])
+    );
     assert_eq!(env.cache_files().len(), 2);
 
     // -- normal still: stored size, aspect fill by the viewport
@@ -1088,6 +1105,12 @@ fn full_session() {
         assert_eq!(cw, 40 * 256 * 256 / 144);
         assert_eq!(x, (90 * 256 - cw) / 2);
     }
+    env.ok(&["img", photo_path, "-o", "HDMI-A-1", "--anchor", "right"]);
+    {
+        let [x, y, cw, _] = env.mock().surface_of_output(1).unwrap().src.unwrap();
+        assert_eq!((x, y), (90 * 256 - cw, 0));
+    }
+    env.ok(&["img", photo_path, "-o", "HDMI-A-1"]);
     // the cache file of the old still is deleted
     assert_eq!(env.cache_files().len(), 2);
     wait("still buffer destroyed", || env.mock().live_buffers == 1);
@@ -1121,7 +1144,10 @@ fn full_session() {
     // -- kill; the state comes back at the next start
     env.assert_no_errors();
     let state = std::fs::read_to_string(env.dir.join("state/pixelwp/state")).unwrap();
-    assert_eq!(state, format!("all img {gif}\nHDMI-A-1 img {photo_path}\n"));
+    assert_eq!(
+        state,
+        format!("all img center {gif}\nHDMI-A-1 img center {photo_path}\n")
+    );
     env.ok(&["kill"]);
     assert_eq!(env.daemon.take().unwrap().wait().unwrap().code(), Some(0));
     assert!(!env.dir.join("rt/pixelwp-wayland-test.sock").exists());
@@ -1224,8 +1250,9 @@ fn targets_4k() {
     env.assert_no_errors();
 }
 
-/// A burn transition: the texture goes from the old wallpaper, through a mix of
-/// the two, to the new wallpaper. Then the animation plays.
+/// A transition: the texture goes from the old wallpaper, through a mix of
+/// the two, to the new wallpaper. The animation plays during the transition
+/// and after it.
 #[test]
 fn burn_transition() {
     let outputs = vec![
@@ -1268,6 +1295,12 @@ fn burn_transition() {
         .collect();
     let mut mixed = [false; 2];
     let mut done = [false; 2];
+    // the frames of the new wallpaper that were in a mix
+    let mut live = [false; 3];
+    // the pixels of each frame that are different from frame 0
+    let marks: Vec<Vec<usize>> = (refs[0].iter())
+        .map(|r| (0..r.len()).filter(|i| r[*i] != refs[0][0][*i]).collect())
+        .collect();
     while !(done[0] && done[1]) {
         assert!(start.elapsed() < Duration::from_secs(20), "no end");
         for o in 0..2 {
@@ -1282,13 +1315,17 @@ fn burn_transition() {
             let n = texture.len();
             let count = |f: &dyn Fn(usize) -> bool| (0..n).filter(|i| f(*i)).count();
             let old_px = count(&|i| texture[i] == old);
-            let new_px = count(&|i| texture[i] == refs[o][0][i]);
+            let new_px = count(&|i| refs[o].iter().any(|r| texture[i] == r[i]));
             assert!(old_px + new_px > n / 2, "output {o}: {old_px} + {new_px}");
             mixed[o] |= old_px > n / 10 && new_px > n / 10;
+            for f in 1..3 {
+                live[f] |= o == 0 && marks[f].iter().all(|i| texture[*i] == refs[0][f][*i]);
+            }
         }
         std::thread::sleep(Duration::from_millis(15));
     }
     assert_eq!(mixed, [true; 2]);
+    assert_eq!(live, [false, true, true], "the animation did not play");
     let secs = start.elapsed().as_secs_f64();
     assert!((2.0..6.0).contains(&secs), "the transition took {secs} s");
     let mut seen = [false; 3];

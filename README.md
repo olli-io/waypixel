@@ -32,7 +32,8 @@ pixelwp img city.png --output DP-1        # one output
 pixelwp img "$(fzf)"                      # select a file with a shell tool
 pixelwp clear --color 202020              # solid colour (default 000000)
 pixelwp img forest.gif --fx wipe          # transition for this change only
-pixelwp query                             # <name> <w>x<h> <file|color #RRGGBB> <state>
+pixelwp img forest.gif --anchor bottom    # keep the bottom edge in view
+pixelwp query                             # <name> <w>x<h> <file|color #RRGGBB> <state> [<anchor>]
 pixelwp still ~/lock.png                  # first frame of the largest output, as a PNG
 pixelwp still ~/lock.png --output DP-1    # first frame of one output
 pixelwp pause
@@ -41,6 +42,11 @@ pixelwp kill
 ```
 
 `<state>` is `playing`, `hidden`, `paused` or `static`.
+
+The scale fills the screen and cuts the overflow. `--anchor <name>` sets the part
+of the image that stays in view: `center` (default), `top`, `bottom`, `left`,
+`right`, `topleft`, `topright`, `bottomleft` or `bottomright`. `query` shows an
+anchor only when it is not `center`.
 
 ## Transitions
 
@@ -65,6 +71,9 @@ transition = sweep
 The daemon reads the file at each change, so no restart is necessary. `--fx <name>`
 has priority over the file. There is no transition when the old or the new
 image is not pixel art.
+
+An animation plays during the transition, for the old and for the new
+wallpaper.
 
 Exit codes: 0 = ok, 1 = error, 2 = usage error, 3 = the daemon is not running.
 

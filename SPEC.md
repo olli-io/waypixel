@@ -56,9 +56,9 @@ file ─(child: image crate)─▶ pixel-art detect ─▶ 1× frames ─▶ til
 | Command | Action |
 |---|---|
 | `pixelwp daemon` | Start the daemon in the foreground. If a daemon already runs: print a message, exit 0. |
-| `pixelwp img <path> [--output <name\|all>] [--fx <name>]` | Set the wallpaper. Default `all`. `--fx`: see §9a. |
+| `pixelwp img <path> [--output <name\|all>] [--fx <name>] [--anchor <name>]` | Set the wallpaper. Default `all`. `--fx`: see §9a. `--anchor`: see §8. |
 | `pixelwp clear [--color <hex>] [--output ...] [--fx ...]` | Solid colour. Default `000000`. |
-| `pixelwp query` | One line per output: `<name> <w>x<h> <file\|color #RRGGBB> <state>` |
+| `pixelwp query` | One line per output: `<name> <w>x<h> <file\|color #RRGGBB> <state> [<anchor>]`. The anchor is shown only when it is not `center`. |
 | `pixelwp still <file.png> [--output <name>]` | Write frame 0 of one output as a PNG. Default: the largest output. The client does this: it reads `query` and the cache file. Pixel art has the output size and the integer scale; other images have the stored size; a colour is 1×1. |
 | `pixelwp pause` / `resume` | Manual pause. |
 | `pixelwp kill` | Stop the daemon. |
@@ -72,7 +72,7 @@ file ─(child: image crate)─▶ pixel-art detect ─▶ 1× frames ─▶ til
 ## 5. IPC
 - Socket: `$XDG_RUNTIME_DIR/pixelwp-<WAYLAND_DISPLAY basename>.sock`, mode 0600.
 - One connection carries one request and one reply. Both are plain text.
-- Request: the arguments, each ended by a NUL byte, for example `img\0/a b.gif\0all\0config\0`. The last argument is the transition name, or `config`. The client then shuts down its write side.
+- Request: the arguments, each ended by a NUL byte, for example `img\0/a b.gif\0all\0config\0center\0`. The arguments after the target are the transition name (or `config`) and the anchor. The client then shuts down its write side.
 - Reply: the first line is `ok` or `error <text>`. For `query`, the output lines of §4 follow `ok`. The daemon formats them; the client prints them unchanged.
 - An `img` reply waits until the file is decoded or found in the cache, and the first frame is committed. The daemon holds the connection open and replies when the decode child exits.
 
@@ -125,10 +125,11 @@ Index (frameCount entries): u32 delayMs, u32 rectCount,
   - The buffer is the physical size.
   - The viewport destination is the logical size, so 1 buffer pixel = 1 panel pixel.
   - k = `max(1, ceil(W/w), ceil(H/h))`.
-  - The offset is `ox = (k·w − W)/2` and `oy = (k·h − H)/2`, with integer division.
+  - The offset is `ox = (k·w − W)·ax/2` and `oy = (k·h − H)·ay/2`, with integer division. The anchor gives `ax` and `ay`: 0 = left / top, 1 = centre, 2 = right / bottom.
 - **Other stills (aspect fill):**
   - The buffer is the stored size. The daemon decompresses frame 0 straight into it.
-  - The viewport source is the aspect-fill crop rect in `wl_fixed`, and the destination is the logical size. The compositor scales with its normal filter.
+  - The viewport source is the aspect-fill crop rect in `wl_fixed`, and the destination is the logical size. The compositor scales with its normal filter. The anchor moves the crop rect as it moves the offset of pixel art.
+- **Anchor:** `--anchor <center|top|bottom|left|right|topleft|topright|bottomleft|bottomright>`. The default is `center`. `top-left` and `top_left` are also correct. The anchor is part of the wallpaper of an output: a transition uses it, and `still` reads it from `query`.
 - **Colour:** a 1×1 buffer with the viewport destination at the logical size. It uses almost no memory.
 - **Changes:** on `configure` or a scale event, the daemon builds the Target of that output again and renders it in full. On `global_remove`, it destroys the Target. There is no debounce, because Wayland events come in batches ending in `done` or `configure`.
 
@@ -177,8 +178,9 @@ The items below describe burn, and the parts that all transitions share.
 - **Order:** the fire starts at a random cell. The cells start to burn in the link order of the simple Prim's algorithm (a random spanning tree), at a rate that burns all cells in approximately 2 s.
 - **Cell:** old wallpaper → 8 fire colours (`FFFFFF` … `510100`, 11 steps in total) → new wallpaper. One burnt cell in 64 emits a smoke cell that rises for 16 steps (`504F4F` … `C7C7C7`).
 - **Step:** 33 ms, on the timerfd. A step has no allocation.
-- **Images:** the old and the new wallpaper are 1× canvases, each with its own integer scale. A colour is a 1 × 1 canvas. An old animation stops at its current frame. A new animation shows frame 0 and starts after the transition. If one of the two images is not pixel art, there is no transition.
-- **Render:** each cell has a display code (old, new, old in grey, new moved by n cells, or a colour) and the step of its last change. A buffer that holds step j gets only the cells that changed after j. The damage is the bounding box of the cells that changed in the step.
+- **Images:** the old and the new wallpaper are 1× canvases, each with its own integer scale. A colour is a 1 × 1 canvas. An animation plays during the transition: the old one keeps its player until the last step, and the new one starts at frame 0 with the transition. Thus two players can run for the time of a transition. The players only advance their canvases; the steps draw the frames. A player of a transition does not become `hidden`. If one of the two images is not pixel art, there is no transition.
+- **Render:** each cell has a display code (old, new, old in grey, new moved by n cells, or a colour) and the step of its last change. A buffer records the step and the frame of each player that it holds. A buffer that holds step j gets the cells that changed after j. For each rect that changed in an image after the frame that the buffer holds, it also gets the cells that show that image there. For slide, a rect of the new image draws again the full width of the moved bands in its rows. The damage is the bounding box of the cells that changed in the step, and one bounding box for each such rect.
+- **Grey:** for sweep, the grey image gets the rects that changed in the old image.
 - **Output:** during the transition, the output has a buffer pool of the physical size. A `configure` or a scale change ends the transition on that output. After the last step, the output builds its normal Target.
 - Manual pause does not stop a transition. An output that is not ready skips steps.
 
@@ -194,7 +196,7 @@ There is no pause timer. Two rules apply:
 When no player has a deadline, the timer is disarmed. The current frame stays on screen. The buffers stay valid, so no full render is necessary on resume.
 
 ## 11. State and start at login
-- **State:** `$XDG_STATE_HOME/pixelwp/state`, one line per target: `<name|all> img <path>` or `<name|all> color <hex>`.
+- **State:** `$XDG_STATE_HOME/pixelwp/state`, one line per target: `<name|all> img <anchor> <path>` or `<name|all> color <hex>`. A line without an anchor (the path starts with `/`) has the anchor `center`.
   - It is written with a temp file + rename on each change, and read at daemon start.
   - A new output uses its own line, or else the `all` line.
 - **Start at login:** the repo contains `pixelwp.service`, a systemd user unit. The README tells the user how to copy and enable it. Its settings:

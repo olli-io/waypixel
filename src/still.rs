@@ -13,7 +13,7 @@ use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 
 use crate::cache::{self, Cache};
 use crate::diff::Rect;
-use crate::scale::{Geom, upscale_rect};
+use crate::scale::{Anchor, Geom, upscale_rect};
 use crate::{client, ipc};
 
 /// One line of the `query` reply.
@@ -23,17 +23,24 @@ struct Line<'a> {
     size: (u32, u32),
     /// a file path or `color #RRGGBB`
     what: &'a str,
+    anchor: Anchor,
 }
 
 fn parse_line(line: &str) -> Option<Line<'_>> {
     let (name, rest) = line.split_once(' ')?;
     let (size, rest) = rest.split_once(' ')?;
-    let (what, _state) = rest.rsplit_once(' ')?;
+    let (rest, last) = rest.rsplit_once(' ')?;
+    // the last word is the state, or an anchor that is not the default
+    let (what, anchor) = match Anchor::parse(last) {
+        Some(anchor) => (rest.rsplit_once(' ')?.0, anchor),
+        None => (rest, Anchor::default()),
+    };
     let (w, h) = size.split_once('x')?;
     Some(Line {
         name,
         size: (w.parse().ok()?, h.parse().ok()?),
         what,
+        anchor,
     })
 }
 
@@ -55,7 +62,7 @@ fn render(line: &Line) -> Result<(Vec<u32>, u32, u32), String> {
     if sw == 0 || sh == 0 {
         return Err(format!("output {} has no size", line.name));
     }
-    let geom = Geom::new((cache.w, cache.h), (sw, sh));
+    let geom = Geom::new((cache.w, cache.h), (sw, sh), line.anchor);
     let mut out = vec![0u32; sw as usize * sh as usize];
     upscale_rect(&canvas, &mut out, &geom, Rect::new(0, 0, cache.w, cache.h));
     Ok((out, sw, sh))
@@ -125,6 +132,16 @@ mod tests {
                 name: "DP-2",
                 size: (3840, 2160),
                 what: "/a b/c d.gif",
+                anchor: Anchor::default(),
+            })
+        );
+        assert_eq!(
+            parse_line("DP-2 3840x2160 /a b/c d.gif static top-left"),
+            Some(Line {
+                name: "DP-2",
+                size: (3840, 2160),
+                what: "/a b/c d.gif",
+                anchor: Anchor::parse("topleft").unwrap(),
             })
         );
         assert_eq!(

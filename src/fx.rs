@@ -15,7 +15,7 @@
 //! integer scale, as for an animation.
 
 use crate::diff::Rect;
-use crate::scale::{Geom, upscale_screen};
+use crate::scale::{Anchor, Geom, upscale_screen};
 
 /// Grid size in cells.
 pub const GRID_W: usize = 540;
@@ -150,6 +150,7 @@ pub struct Canvas {
     pub w: u32,
     pub h: u32,
     pub px: Box<[u32]>,
+    pub anchor: Anchor,
 }
 
 impl Canvas {
@@ -158,23 +159,28 @@ impl Canvas {
             w: 1,
             h: 1,
             px: Box::new([color]),
+            anchor: Anchor::default(),
         }
     }
 
     pub fn geom(&self, screen: (u32, u32)) -> Geom {
-        Geom::new((self.w, self.h), screen)
+        Geom::new((self.w, self.h), screen, self.anchor)
     }
 
     /// The pixels in grey.
     pub fn grey(&self) -> Box<[u32]> {
-        let luma =
-            |p: u32| (((p >> 16) & 0xFF) * 77 + ((p >> 8) & 0xFF) * 150 + (p & 0xFF) * 29) >> 8;
-        self.px
-            .iter()
-            .map(|p| 0xFF00_0000 | (luma(*p) * 0x01_0101))
-            .collect()
+        self.px.iter().map(|p| grey(*p)).collect()
     }
 }
+
+/// One pixel in grey.
+pub fn grey(p: u32) -> u32 {
+    let luma = (((p >> 16) & 0xFF) * 77 + ((p >> 8) & 0xFF) * 150 + (p & 0xFF) * 29) >> 8;
+    0xFF00_0000 | (luma * 0x01_0101)
+}
+
+/// A screen area: (x0, y0, x1, y1).
+pub type Area = (usize, usize, usize, usize);
 
 /// The images of one output for a render. Each has its own scale for the screen.
 pub struct Layers<'a> {
@@ -515,56 +521,113 @@ impl Effect {
         ))
     }
 
-    /// Brings a screen buffer that holds step `holds` up to the current step.
-    ///
-    /// `g` maps the grid to the screen.
-    pub fn render(&self, dst: &mut [u32], g: &Geom, layers: &Layers, holds: Option<u32>) {
-        let Geom {
-            k, ox, oy, sw, sh, ..
-        } = *g;
-        let (old, new) = (layers.old, layers.new);
-        // the cells that the screen shows
-        let (cx0, cx1) = (ox / k, (sw - 1 + ox) / k);
-        let (cy0, cy1) = (oy / k, (sh - 1 + oy) / k);
-        let stale = |cell: usize| holds.is_none_or(|h| self.stamp[cell] > h);
+    /// Calls `f(code, area)` for each run of cells in a row that have the same
+    /// display code and for which `pick` is true. Only the part of the cells
+    /// inside the screen area `clip` is used.
+    fn runs(
+        &self,
+        g: &Geom,
+        (ax0, ay0, ax1, ay1): Area,
+        pick: impl Fn(usize) -> bool,
+        mut f: impl FnMut(u32, Area),
+    ) {
+        let Geom { k, ox, oy, .. } = *g;
+        let (cx0, cx1) = ((ax0 + ox) / k, (ax1 - 1 + ox) / k);
+        let (cy0, cy1) = ((ay0 + oy) / k, (ay1 - 1 + oy) / k);
         for cy in cy0..=cy1 {
-            let y0 = (cy * k).saturating_sub(oy);
-            let y1 = ((cy + 1) * k - oy).min(sh);
+            let y0 = (cy * k).saturating_sub(oy).max(ay0);
+            let y1 = ((cy + 1) * k - oy).min(ay1);
             let row = cy * GRID_W;
             let mut cx = cx0;
             while cx <= cx1 {
-                if !stale(row + cx) {
+                if !pick(row + cx) {
                     cx += 1;
                     continue;
                 }
-                // a run of cells with the same display code
                 let code = self.disp[row + cx];
                 let start = cx;
-                while cx <= cx1 && self.disp[row + cx] == code && stale(row + cx) {
+                while cx <= cx1 && self.disp[row + cx] == code && pick(row + cx) {
                     cx += 1;
                 }
-                let x0 = (start * k).saturating_sub(ox);
-                let x1 = (cx * k - ox).min(sw);
-                let area = (x0, y0, x1, y1);
-                match code {
-                    OLD => upscale_screen(old.0, dst, old.1, area),
-                    NEW => upscale_screen(new.0, dst, new.1, area),
-                    GREY => upscale_screen(layers.grey, dst, old.1, area),
-                    color if color >> 24 == 0xFF => {
-                        for y in y0..y1 {
-                            dst[y * sw + x0..y * sw + x1].fill(color);
-                        }
-                    }
-                    shifted => {
-                        // The grid can be wider than the screen. The limit
-                        // keeps the source inside the image.
-                        let shift = ((shifted & 0xFFFF) as usize * k).min(sw - x1);
-                        let mut moved = *new.1;
-                        moved.ox += shift;
-                        upscale_screen(new.0, dst, &moved, area);
-                    }
-                }
+                let x0 = (start * k).saturating_sub(ox).max(ax0);
+                let x1 = (cx * k - ox).min(ax1);
+                f(code, (x0, y0, x1, y1));
             }
+        }
+    }
+
+    /// Brings a screen buffer that holds step `holds` up to the current step.
+    /// This does not include the changes of the images: see `render_layer`.
+    ///
+    /// `g` maps the grid to the screen.
+    pub fn render(&self, dst: &mut [u32], g: &Geom, layers: &Layers, holds: Option<u32>) {
+        let stale = |cell: usize| holds.is_none_or(|h| self.stamp[cell] > h);
+        self.runs(g, (0, 0, g.sw, g.sh), stale, |code, area| {
+            draw(dst, g, layers, code, area)
+        });
+    }
+
+    /// Calls `f(code, area)` for the cells that show the 1× rect `r` of an
+    /// image. `layer` maps the image to the screen. `new` selects the new image.
+    fn layer_runs(&self, g: &Geom, layer: &Geom, new: bool, r: Rect, mut f: impl FnMut(u32, Area)) {
+        let Some(area) = layer.map(r) else {
+            return;
+        };
+        let shows = |code: u32| match new {
+            true => code == NEW,
+            false => code == OLD || code == GREY,
+        };
+        self.runs(g, area, |cell| shows(self.disp[cell]), &mut f);
+        if new && self.kind == Kind::Slide {
+            // A moved band shows the rect at a different x. The full width
+            // of the band rows is drawn again.
+            let strip = (0, area.1, g.sw, area.3);
+            let moved = |cell: usize| self.disp[cell] >> 24 == SHIFTED >> 24;
+            self.runs(g, strip, moved, &mut f);
+        }
+    }
+
+    /// Draws again the cells that show the 1× rect `r` of an image that
+    /// changed: the old image (and its grey) or, with `new`, the new image.
+    pub fn render_layer(&self, dst: &mut [u32], g: &Geom, layers: &Layers, new: bool, r: Rect) {
+        let layer = if new { layers.new.1 } else { layers.old.1 };
+        self.layer_runs(g, layer, new, r, |code, area| {
+            draw(dst, g, layers, code, area)
+        });
+    }
+
+    /// The bounds of the screen area that `render_layer` draws for this rect.
+    pub fn layer_damage(&self, g: &Geom, layer: &Geom, new: bool, r: Rect) -> Option<Area> {
+        let mut bounds: Option<Area> = None;
+        self.layer_runs(g, layer, new, r, |_, (x0, y0, x1, y1)| {
+            let b = bounds.get_or_insert((x0, y0, x1, y1));
+            *b = (b.0.min(x0), b.1.min(y0), b.2.max(x1), b.3.max(y1));
+        });
+        bounds
+    }
+}
+
+/// Draws the screen area of a run of cells with the display code `code`.
+fn draw(dst: &mut [u32], g: &Geom, layers: &Layers, code: u32, area: Area) {
+    let (x0, y0, x1, y1) = area;
+    let sw = g.sw;
+    let (old, new) = (layers.old, layers.new);
+    match code {
+        OLD => upscale_screen(old.0, dst, old.1, area),
+        NEW => upscale_screen(new.0, dst, new.1, area),
+        GREY => upscale_screen(layers.grey, dst, old.1, area),
+        color if color >> 24 == 0xFF => {
+            for y in y0..y1 {
+                dst[y * sw + x0..y * sw + x1].fill(color);
+            }
+        }
+        shifted => {
+            // The grid can be wider than the screen. The limit
+            // keeps the source inside the image.
+            let shift = ((shifted & 0xFFFF) as usize * g.k).min(sw - x1);
+            let mut moved = *new.1;
+            moved.ox += shift;
+            upscale_screen(new.0, dst, &moved, area);
         }
     }
 }
@@ -591,6 +654,7 @@ mod tests {
             w,
             h,
             px: (0..w * h).map(|_| 0xFF00_0000 | rng.below(200)).collect(),
+            anchor: Anchor::default(),
         }
     }
 
@@ -645,7 +709,7 @@ mod tests {
         ];
         for (kind, (screen, nbufs, skip)) in KINDS.iter().flat_map(|k| cases.map(|c| (*k, c))) {
             let mut fx = Effect::new(kind, 11);
-            let g = Geom::new((GRID_W as u32, GRID_H as u32), screen);
+            let g = Geom::new((GRID_W as u32, GRID_H as u32), screen, Anchor::default());
             let (old, new) = (art(64, 36, 1), art(90, 45, 2));
             let (og, ng, grey) = (old.geom(screen), new.geom(screen), old.grey());
             let layers = Layers {
@@ -675,6 +739,75 @@ mod tests {
             assert!((50..200).contains(&fx.step), "{kind:?}: {} steps", fx.step);
             fx.render(&mut full, &g, &layers, None);
             assert!(full == last, "{kind:?}");
+        }
+    }
+
+    /// The two images change during the transition, as with two animations.
+    /// Buffers in rotation show the same pixels as a full render.
+    #[test]
+    fn live_layers_match_full_render() {
+        for (kind, screen) in KINDS
+            .iter()
+            .flat_map(|k| [(1100, 520), (300, 400)].map(|s| (*k, s)))
+        {
+            let mut fx = Effect::new(kind, 7);
+            let g = Geom::new((GRID_W as u32, GRID_H as u32), screen, Anchor::default());
+            let (mut old, mut new) = (art(64, 36, 1), art(90, 45, 2));
+            let (og, ng) = (old.geom(screen), new.geom(screen));
+            let mut grey = old.grey();
+            let mut rng = Rng(kind as u64 + 40);
+            // the rects that changed at each frame: (old, new)
+            let mut frames: Vec<(Rect, Rect)> = Vec::new();
+            let n_px = g.sw * g.sh;
+            let mut bufs = vec![(vec![0xDEAD_BEEF; n_px], None::<(u32, usize)>); 2];
+            let mut full = vec![0; n_px];
+            let mut turn = 0;
+            while fx.advance() {
+                // a frame comes each 2 steps; a render comes each 3 steps
+                if fx.step.is_multiple_of(2) {
+                    let mut change = |c: &mut Canvas| {
+                        let (w, h) = (1 + rng.below(c.w / 2), 1 + rng.below(c.h / 2));
+                        let r = Rect::new(rng.below(c.w - w), rng.below(c.h - h), w, h);
+                        for y in r.y..r.y + r.h {
+                            for x in r.x..r.x + r.w {
+                                c.px[y as usize * c.w as usize + x as usize] =
+                                    0xFF00_0000 | rng.below(200);
+                            }
+                        }
+                        r
+                    };
+                    frames.push((change(&mut old), change(&mut new)));
+                    grey = old.grey();
+                }
+                if !fx.step.is_multiple_of(3) {
+                    continue;
+                }
+                let layers = Layers {
+                    old: (&old.px, &og),
+                    new: (&new.px, &ng),
+                    grey: &grey,
+                };
+                turn += 1;
+                let (buf, holds) = &mut bufs[turn % 2];
+                fx.render(buf, &g, &layers, holds.map(|h| h.0));
+                if let Some((_, frame)) = *holds {
+                    for (o, n) in &frames[frame..] {
+                        for (is_new, r, lg) in [(false, *o, &og), (true, *n, &ng)] {
+                            let before = buf.clone();
+                            fx.render_layer(buf, &g, &layers, is_new, r);
+                            // the damage covers the pixels that changed
+                            let d = fx.layer_damage(&g, lg, is_new, r).unwrap_or_default();
+                            for i in (0..n_px).filter(|i| before[*i] != buf[*i]) {
+                                let (x, y) = (i % g.sw, i / g.sw);
+                                assert!(x >= d.0 && x < d.2 && y >= d.1 && y < d.3);
+                            }
+                        }
+                    }
+                }
+                *holds = Some((fx.step, frames.len()));
+                fx.render(&mut full, &g, &layers, None);
+                assert!(*buf == full, "{kind:?}, step {}", fx.step);
+            }
         }
     }
 

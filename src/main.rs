@@ -18,7 +18,7 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 Usage:
   pixelwp daemon                                 start the daemon in the foreground
-  pixelwp img <path> [--output <name|all>] [--fx <name>]
+  pixelwp img <path> [--output <name|all>] [--fx <name>] [--anchor <name>]
                                                  set the wallpaper (default: all)
   pixelwp clear [--color <hex>] [--output ...] [--fx ...]
                                                  solid colour (default: 000000)
@@ -31,6 +31,10 @@ Usage:
 --fx is the transition: burn, sweep, slide, wipe or disabled. The default is the
 `transition` key in ~/.config/pixelwp/config, or else burn.
 
+--anchor is the part of the image that stays in view when the scale cuts the
+overflow: center (default), top, bottom, left, right, topleft, topright,
+bottomleft or bottomright.
+
 Exit codes: 0 = ok, 1 = error, 2 = usage error, 3 = the daemon is not running";
 
 #[derive(Debug, PartialEq)]
@@ -40,6 +44,7 @@ enum Cmd {
         path: String,
         output: String,
         fx: String,
+        anchor: String,
     },
     Clear {
         color: String,
@@ -62,13 +67,14 @@ enum Cmd {
     Help,
 }
 
-/// Positional arguments and the values of `--output`, `--color` and `--fx`.
+/// Positional arguments and the values of the options.
 #[derive(Default)]
 struct Parsed {
     positional: Vec<String>,
     output: Option<String>,
     color: Option<String>,
     fx: Option<String>,
+    anchor: Option<String>,
 }
 
 impl Parsed {
@@ -114,6 +120,7 @@ fn parse_options(args: &[String], allowed: &[&str]) -> Result<Parsed, String> {
         match name {
             "--output" => parsed.output = Some(value),
             "--fx" => parsed.fx = Some(value),
+            "--anchor" => parsed.anchor = Some(value),
             _ => parsed.color = Some(value),
         }
     }
@@ -139,12 +146,18 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
         "resume" => no_args(Cmd::Resume),
         "kill" => no_args(Cmd::Kill),
         "img" => {
-            let p = parse_options(rest, &["--output", "--fx"])?;
+            let p = parse_options(rest, &["--output", "--fx", "--anchor"])?;
             let [path] = p.positional.as_slice() else {
                 return Err("img needs one path".into());
             };
+            let anchor = p.anchor.clone().unwrap_or_else(|| "center".into());
+            if scale::Anchor::parse(&anchor).is_none() {
+                let names = scale::Anchor::NAMES;
+                return Err(format!("bad anchor {anchor}: use {names}"));
+            }
             Ok(Cmd::Img {
                 path: path.clone(),
+                anchor,
                 fx: p.fx()?,
                 output: p.output.unwrap_or_else(|| "all".into()),
             })
@@ -210,11 +223,16 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Cmd::Img { path, output, fx } => {
+        Cmd::Img {
+            path,
+            output,
+            fx,
+            anchor,
+        } => {
             // the daemon has a different working directory
             match std::fs::canonicalize(&path) {
                 Ok(abs) => match abs.to_str() {
-                    Some(abs) => client::request(&["img", abs, &output, &fx]),
+                    Some(abs) => client::request(&["img", abs, &output, &fx, &anchor]),
                     None => {
                         eprintln!("pixelwp: {path}: the path is not UTF-8");
                         1
@@ -254,9 +272,16 @@ mod tests {
                 path: path.into(),
                 output: output.into(),
                 fx: "config".into(),
+                anchor: "center".into(),
             })
         };
         assert_eq!(p(&["img", "a b.gif"]), img("a b.gif", "all"));
+        assert!(matches!(
+            p(&["img", "a.gif", "--anchor", "top-left"]),
+            Ok(Cmd::Img { anchor, .. }) if anchor == "top-left"
+        ));
+        assert!(p(&["img", "a", "--anchor", "middle"]).is_err());
+        assert!(p(&["clear", "--anchor", "top"]).is_err());
         assert_eq!(
             p(&["img", "a.gif", "--output", "DP-1"]),
             img("a.gif", "DP-1")

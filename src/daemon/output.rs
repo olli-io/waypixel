@@ -3,12 +3,12 @@
 use waybackend::types::{ObjectId, WlFixed};
 
 use super::player::Player;
-use super::pool::Pool;
+use super::pool::{MAX_BUFFERS, Pool};
 use super::wayland::{Obj, Wl, req, zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use crate::cache::{Cache, Hash};
 use crate::diff::Rect;
-use crate::fx::{Canvas, Effect, GRID_H, GRID_W, Kind, Layers};
-use crate::scale::{Geom, upscale_rect};
+use crate::fx::{Area, Canvas, Effect, GRID_H, GRID_W, Kind, Layers, grey};
+use crate::scale::{Anchor, Geom, upscale_rect};
 
 /// What an output shows.
 #[derive(Clone, Debug, PartialEq)]
@@ -16,35 +16,57 @@ pub enum Wall {
     /// XRGB colour
     Color(u32),
     /// a still image; the cache file is opened only for a render
-    Still { hash: Hash, path: String },
+    Still {
+        hash: Hash,
+        path: String,
+        anchor: Anchor,
+    },
     /// a pixel-art animation, drawn from the player with this id
-    Anim { player: u32, path: String },
+    Anim {
+        player: u32,
+        path: String,
+        anchor: Anchor,
+    },
+}
+
+/// What a buffer shows during a transition.
+#[derive(Clone, Copy, PartialEq)]
+struct Held {
+    /// the step of the effect
+    step: u32,
+    /// the frames (player `seq`) of the old and the new wallpaper; 0 for no player
+    old: u64,
+    new: u64,
 }
 
 /// The part of a transition that is specific to one output.
 struct Fx {
     /// id of the transition
     id: u32,
-    /// the wallpaper before the transition
+    /// the wallpaper before the transition, at the start of the transition
     old: Canvas,
-    /// `old` in grey, for sweep
+    /// the player of the old wallpaper, which has the current pixels of `old`
+    old_player: Option<u32>,
+    /// the old wallpaper in grey, for sweep
     grey: Box<[u32]>,
+    /// the frame of the old player that `grey` shows
+    grey_seq: u64,
     old_geom: Geom,
     new_geom: Geom,
     /// grid of the effect → screen
     geom: Geom,
-    /// the step of the last commit
-    last_committed: u32,
+    /// what each buffer of the pool shows
+    held: [Option<Held>; MAX_BUFFERS],
+    last_committed: Held,
 }
 
-impl Fx {
-    fn layers<'a>(&'a self, new: &'a Canvas) -> Layers<'a> {
-        Layers {
-            old: (&self.old.px, &self.old_geom),
-            new: (&new.px, &self.new_geom),
-            grey: &self.grey,
-        }
-    }
+fn find(players: &[Player], id: Option<u32>) -> Option<&Player> {
+    players.iter().find(|p| Some(p.id) == id)
+}
+
+/// The current pixels of a wallpaper: from its player, or else from the canvas.
+fn pixels<'a>(player: Option<&'a Player>, canvas: &'a Canvas) -> &'a [u32] {
+    player.map_or(&canvas.px[..], Player::canvas)
 }
 
 pub struct Output {
@@ -190,9 +212,17 @@ impl Output {
         self.fx.as_ref().map(|fx| fx.id)
     }
 
-    /// The player that this output draws from. During a transition, this is `None`.
+    /// The player that this output draws from. During a transition, this is
+    /// `None`: the steps of the transition draw the frames.
     pub fn playing(&self) -> Option<u32> {
         self.player().filter(|_| self.fx.is_none())
+    }
+
+    /// True when the output shows frames of this player: as its wallpaper, or
+    /// as the old wallpaper of its transition.
+    pub fn uses(&self, player: u32) -> bool {
+        let old = self.fx.as_ref().and_then(|fx| fx.old_player);
+        self.player() == Some(player) || old == Some(player)
     }
 
     /// True when the frame callback of the last commit has arrived.
@@ -242,12 +272,12 @@ impl Output {
                 let pool = self.color_pool(wl, *color);
                 self.commit_full(wl, pool, None, false);
             }
-            Wall::Still { hash, .. } => {
+            Wall::Still { hash, anchor, .. } => {
                 let cache = Cache::open(&crate::cache::path_for(hash))?;
                 if cache.pixel_art {
                     let mut canvas = vec![0u32; cache.w as usize * cache.h as usize];
                     cache.apply(0, &mut canvas, &mut [])?;
-                    let g = Geom::new((cache.w, cache.h), (pw, ph));
+                    let g = Geom::new((cache.w, cache.h), (pw, ph), *anchor);
                     let mut pool = Pool::new(wl, pw, ph).map_err(shm)?;
                     upscale_rect(
                         &canvas,
@@ -264,16 +294,16 @@ impl Output {
                         pool.destroy(wl);
                         return Err(e);
                     }
-                    let crop = fill_crop((cache.w, cache.h), logical);
+                    let crop = fill_crop((cache.w, cache.h), logical, *anchor);
                     self.commit_full(wl, Some(pool), Some(crop), false);
                 }
             }
-            Wall::Anim { player, .. } => {
+            Wall::Anim { player, anchor, .. } => {
                 let player = players
                     .iter()
                     .find(|p| p.id == *player)
                     .ok_or("the player does not exist")?;
-                let g = Geom::new(player.size(), (pw, ph));
+                let g = Geom::new(player.size(), (pw, ph), *anchor);
                 let mut pool = Pool::new(wl, pw, ph).map_err(shm)?;
                 player.render(pool.pixels(0), &g, None);
                 pool.bufs[0].holds = Some(player.seq);
@@ -373,13 +403,15 @@ impl Output {
 
     /// Starts a transition from `old` to `new`, which is the image of the
     /// wall of this output. Returns false when the output cannot show it.
+    ///
+    /// `old_player` is the player of the old wallpaper, if it is an animation.
     pub fn start_fx(
         &mut self,
         wl: &mut Wl,
-        id: u32,
-        effect: &Effect,
-        old: Canvas,
+        (id, effect): (u32, &Effect),
+        (old, old_player): (Canvas, Option<u32>),
         new: &Canvas,
+        players: &[Player],
     ) -> bool {
         if self.logical.is_none() {
             return false;
@@ -394,69 +426,146 @@ impl Output {
         self.callback = None;
         self.geom = None;
         self.last_committed = None;
-        let fx = Fx {
+        let (old_live, new_live) = (find(players, old_player), find(players, self.player()));
+        let now = Held {
+            step: effect.step,
+            old: old_live.map_or(0, |p| p.seq),
+            new: new_live.map_or(0, |p| p.seq),
+        };
+        let mut held = [None; MAX_BUFFERS];
+        held[0] = Some(now);
+        let mut fx = Fx {
             id,
             old_geom: old.geom(screen),
             new_geom: new.geom(screen),
-            geom: Geom::new((GRID_W as u32, GRID_H as u32), screen),
-            grey: match effect.kind {
-                Kind::Sweep => old.grey(),
-                _ => Box::new([]),
-            },
+            geom: Geom::new((GRID_W as u32, GRID_H as u32), screen, Anchor::default()),
+            grey: Box::new([]),
+            grey_seq: now.old,
             old,
-            last_committed: effect.step,
+            old_player,
+            held,
+            last_committed: now,
         };
-        effect.render(pool.pixels(0), &fx.geom, &fx.layers(new), None);
-        pool.bufs[0].holds = Some(effect.step as u64);
+        if effect.kind == Kind::Sweep {
+            // `old` is the current frame of its player
+            fx.grey = fx.old.grey();
+        }
+        let layers = Layers {
+            old: (pixels(old_live, &fx.old), &fx.old_geom),
+            new: (pixels(new_live, new), &fx.new_geom),
+            grey: &fx.grey,
+        };
+        effect.render(pool.pixels(0), &fx.geom, &layers, None);
         self.fx = Some(fx);
         self.commit_full(wl, Some(pool), None, true);
         true
     }
 
-    /// Draws the current step of the transition: only the cells that changed.
-    /// There is no allocation when a buffer is free.
-    pub fn fx_tick(&mut self, wl: &mut Wl, effect: &Effect, new: &Canvas) {
+    /// Draws the current step of the transition, with the current frames of
+    /// the two wallpapers: only the cells that changed. There is no allocation
+    /// when a buffer is free.
+    pub fn fx_tick(&mut self, wl: &mut Wl, effect: &Effect, new: &Canvas, players: &[Player]) {
+        let new_player = find(players, self.player());
         let (Some(pool), Some(fx)) = (&mut self.pool, &mut self.fx) else {
             return;
         };
-        if fx.last_committed == effect.step {
+        let old_player = find(players, fx.old_player);
+        let now = Held {
+            step: effect.step,
+            old: old_player.map_or(0, |p| p.seq),
+            new: new_player.map_or(0, |p| p.seq),
+        };
+        let last = fx.last_committed;
+        if last == now {
             return;
         }
-        let damage = if fx.last_committed + 1 == effect.step {
-            let Some(area) = effect.changed().and_then(|r| fx.geom.map(r)) else {
-                // no change on this screen
-                fx.last_committed = effect.step;
-                return;
-            };
-            area
-        } else {
-            (0, 0, fx.geom.sw, fx.geom.sh)
-        };
         let Some(i) = pool.acquire(wl) else {
             return;
         };
-        let holds = pool.bufs[i].holds.map(|step| step as u32);
-        effect.render(pool.pixels(i), &fx.geom, &fx.layers(new), holds);
-        pool.bufs[i].holds = Some(effect.step as u64);
-        pool.bufs[i].busy = true;
-        fx.last_committed = effect.step;
 
+        // the grey of the rects that changed in the old wallpaper
+        if let Some(p) = old_player
+            && !fx.grey.is_empty()
+        {
+            let (src, dst, w) = (p.canvas(), &mut fx.grey, fx.old.w as usize);
+            p.dirty(Some(fx.grey_seq), |r| {
+                for y in r.y as usize..(r.y + r.h) as usize {
+                    let row = y * w + r.x as usize..y * w + (r.x + r.w) as usize;
+                    for (g, s) in dst[row.clone()].iter_mut().zip(&src[row]) {
+                        *g = grey(*s);
+                    }
+                }
+            });
+            fx.grey_seq = p.seq;
+        }
+
+        let layers = Layers {
+            old: (pixels(old_player, &fx.old), &fx.old_geom),
+            new: (pixels(new_player, new), &fx.new_geom),
+            grey: &fx.grey,
+        };
+        // (player, it is the new wallpaper, its geometry)
+        let sides = [
+            (old_player, false, &fx.old_geom),
+            (new_player, true, &fx.new_geom),
+        ];
+        let held = fx.held[i];
+        let dst = pool.pixels(i);
+        effect.render(dst, &fx.geom, &layers, held.map(|h| h.step));
+        if let Some(held) = held {
+            for (player, is_new, _) in sides {
+                let Some(p) = player else { continue };
+                let since = if is_new { held.new } else { held.old };
+                p.dirty(Some(since), |r| {
+                    effect.render_layer(dst, &fx.geom, &layers, is_new, r)
+                });
+            }
+        }
+        fx.held[i] = Some(now);
+        fx.last_committed = now;
+
+        // The damage is relative to the last commit.
         let surface = self.surface;
-        let (x0, y0, x1, y1) = damage;
-        req!(
-            wl,
-            wl_surface::req::attach(surface, Some(pool.bufs[i].id), 0, 0)
-        );
-        req!(
-            wl,
-            wl_surface::req::damage_buffer(
-                surface,
-                x0 as i32,
-                y0 as i32,
-                (x1 - x0) as i32,
-                (y1 - y0) as i32
-            )
-        );
+        let mut damaged = false;
+        let mut damage = |wl: &mut Wl, (x0, y0, x1, y1): Area| {
+            req!(
+                wl,
+                wl_surface::req::damage_buffer(
+                    surface,
+                    x0 as i32,
+                    y0 as i32,
+                    (x1 - x0) as i32,
+                    (y1 - y0) as i32
+                )
+            );
+            damaged = true;
+        };
+        if last.step != now.step && last.step + 1 != now.step {
+            // steps were skipped
+            damage(wl, (0, 0, fx.geom.sw, fx.geom.sh));
+        } else {
+            if last.step != now.step
+                && let Some(area) = effect.changed().and_then(|r| fx.geom.map(r))
+            {
+                damage(wl, area);
+            }
+            for (player, is_new, geom) in sides {
+                let Some(p) = player else { continue };
+                let since = if is_new { last.new } else { last.old };
+                p.dirty(Some(since), |r| {
+                    if let Some(area) = effect.layer_damage(&fx.geom, geom, is_new, r) {
+                        damage(wl, area);
+                    }
+                });
+            }
+        }
+        if !damaged {
+            // no change on this screen
+            return;
+        }
+        let buffer = &mut pool.bufs[i];
+        buffer.busy = true;
+        req!(wl, wl_surface::req::attach(surface, Some(buffer.id), 0, 0));
         self.request_frame(wl);
         req!(wl, wl_surface::req::commit(surface));
     }
@@ -494,8 +603,9 @@ impl Output {
 }
 
 /// Aspect-fill crop of a `buf` image for a `logical` surface, in 1/256 of a
-/// buffer pixel: (x, y, w, h). The rect is always inside the buffer.
-pub fn fill_crop(buf: (u32, u32), logical: (u32, u32)) -> [i32; 4] {
+/// buffer pixel: (x, y, w, h). The rect is always inside the buffer. `anchor`
+/// sets the part of the image that the rect keeps.
+pub fn fill_crop(buf: (u32, u32), logical: (u32, u32), anchor: Anchor) -> [i32; 4] {
     let (bw, bh) = (buf.0 as u64 * 256, buf.1 as u64 * 256);
     let (lw, lh) = (logical.0.max(1) as u64, logical.1.max(1) as u64);
     let (cw, ch) = if bw * lh > bh * lw {
@@ -504,7 +614,8 @@ pub fn fill_crop(buf: (u32, u32), logical: (u32, u32)) -> [i32; 4] {
     } else {
         (bw, (bw * lh / lw).clamp(1, bh))
     };
-    [(bw - cw) / 2, (bh - ch) / 2, cw, ch].map(|v| v as i32)
+    let (x, y) = anchor.offset((bw - cw, bh - ch));
+    [x, y, cw, ch].map(|v| v as i32)
 }
 
 #[cfg(test)]
@@ -513,6 +624,8 @@ mod tests {
 
     #[test]
     fn fill_crop_table() {
+        let center = Anchor::default();
+        let fill_crop = |b, l| super::fill_crop(b, l, center);
         // same aspect: no crop
         assert_eq!(
             fill_crop((1920, 1080), (1280, 720)),
@@ -527,6 +640,18 @@ mod tests {
         assert_eq!(
             fill_crop((1000, 3000), (2000, 1000)),
             [0, 1250 * 256, 1000 * 256, 500 * 256]
+        );
+        // an anchor moves the rect to an edge
+        let at = |b, l, name| super::fill_crop(b, l, Anchor::parse(name).unwrap());
+        assert_eq!(at((4000, 1000), (1000, 1000), "left")[0], 0);
+        assert_eq!(
+            at((4000, 1000), (1000, 1000), "bottomright")[..2],
+            [3000 * 256, 0]
+        );
+        assert_eq!(at((1000, 3000), (2000, 1000), "top")[..2], [0, 0]);
+        assert_eq!(
+            at((1000, 3000), (2000, 1000), "bottom")[..2],
+            [0, 2500 * 256]
         );
         // the rect stays inside the buffer for odd sizes
         for (b, l) in [

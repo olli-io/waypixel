@@ -161,7 +161,7 @@ mod tests {
         write(&path, &frames, w, h, 50);
         let cache = Cache::open(&path).unwrap();
         let mut player = Player::new(1, [0; 32], cache).unwrap();
-        let g = Geom::new((w as u32, h as u32), (131, 77));
+        let g = Geom::new((w as u32, h as u32), (131, 77), Default::default());
         let mut bufs: Vec<Buf> = (0..nbufs)
             .map(|_| Buf {
                 px: vec![0xDEAD_BEEF; g.sw * g.sh],

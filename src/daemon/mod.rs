@@ -25,6 +25,7 @@ use waybackend::types::ObjectId;
 use crate::cache::{self, Cache, Hash};
 use crate::fx::{Canvas, Effect, Kind, STEP_NS};
 use crate::ipc;
+use crate::scale::Anchor;
 use output::{Output, Wall};
 use player::Player;
 use wayland::{Obj, Wl, req};
@@ -98,6 +99,7 @@ enum Spec {
     Img {
         path: String,
         hash: Option<Hash>,
+        anchor: Anchor,
     },
 }
 
@@ -134,10 +136,21 @@ impl State {
                 continue;
             };
             let spec = match kind {
-                "img" => Spec::Img {
-                    path: value.to_owned(),
-                    hash: None,
-                },
+                "img" => {
+                    // a line of an older version has no anchor; a path starts with `/`
+                    let (anchor, path) = match value.split_once(' ') {
+                        Some((anchor, path)) if !value.starts_with('/') => (anchor, path),
+                        _ => ("center", value),
+                    };
+                    let Some(anchor) = Anchor::parse(anchor) else {
+                        continue;
+                    };
+                    Spec::Img {
+                        path: path.to_owned(),
+                        hash: None,
+                        anchor,
+                    }
+                }
                 "color" => match ipc::parse_color(value) {
                     Some(color) => Spec::Color(color),
                     None => continue,
@@ -158,7 +171,9 @@ impl State {
         for e in &self.entries {
             match &e.spec {
                 Spec::Color(c) => text += &format!("{} color {:06x}\n", e.target, c & 0xFF_FFFF),
-                Spec::Img { path, .. } => text += &format!("{} img {}\n", e.target, path),
+                Spec::Img { path, anchor, .. } => {
+                    text += &format!("{} img {} {}\n", e.target, anchor.name(), path)
+                }
             }
         }
         text
@@ -237,6 +252,7 @@ struct Job {
     stderr: File,
     hash: Hash,
     path: String,
+    anchor: Anchor,
     target: String,
     client: Option<u64>,
     /// false for a restore: the state file does not change
@@ -311,14 +327,23 @@ impl Daemon {
 
     /// Returns the wall for an image with a valid cache file. Makes a player for
     /// an animation, if there is none for this file.
-    fn wall_for(&mut self, hash: &Hash, path: &str) -> Result<Wall, String> {
+    fn wall_for(&mut self, hash: &Hash, path: &str, anchor: Anchor) -> Result<Wall, String> {
         let path = path.to_owned();
+        let anim = |player: u32| Wall::Anim {
+            player,
+            path: path.clone(),
+            anchor,
+        };
         if let Some(p) = self.players.iter().find(|p| p.hash == *hash) {
-            return Ok(Wall::Anim { player: p.id, path });
+            return Ok(anim(p.id));
         }
         let cache = Cache::open(&cache::path_for(hash))?;
         if cache.frame_count() == 1 {
-            return Ok(Wall::Still { hash: *hash, path });
+            return Ok(Wall::Still {
+                hash: *hash,
+                path,
+                anchor,
+            });
         }
         let mut player = Player::new(self.next_player, *hash, cache)?;
         self.next_player += 1;
@@ -327,14 +352,14 @@ impl Daemon {
         }
         let id = player.id;
         self.players.push(player);
-        Ok(Wall::Anim { player: id, path })
+        Ok(anim(id))
     }
 
     /// The 1× image of a wall. `None` for an image that is not pixel art.
     fn canvas_of(&self, wall: &Wall) -> Option<Canvas> {
         match wall {
             Wall::Color(color) => Some(Canvas::color(*color)),
-            Wall::Still { hash, .. } => {
+            Wall::Still { hash, anchor, .. } => {
                 let cache = Cache::open(&cache::path_for(hash)).ok()?;
                 if !cache.pixel_art {
                     return None;
@@ -345,15 +370,17 @@ impl Daemon {
                     w: cache.w,
                     h: cache.h,
                     px: px.into(),
+                    anchor: *anchor,
                 })
             }
-            Wall::Anim { player, .. } => {
+            Wall::Anim { player, anchor, .. } => {
                 let p = self.players.iter().find(|p| p.id == *player)?;
                 let (w, h) = p.size();
                 Some(Canvas {
                     w,
                     h,
                     px: p.canvas().into(),
+                    anchor: *anchor,
                 })
             }
         }
@@ -362,6 +389,10 @@ impl Daemon {
     /// Starts a transition from `old` to the wall of the output. Returns
     /// false when there is no transition: one of the images is not pixel art.
     fn start_fx(&mut self, index: usize, old: &Wall, kind: Kind) -> bool {
+        let old_player = match old {
+            Wall::Anim { player, .. } => Some(*player),
+            _ => None,
+        };
         let Some(old) = self.canvas_of(old) else {
             return false;
         };
@@ -390,11 +421,36 @@ impl Daemon {
             }
         };
         let t = &self.transitions[t];
-        self.outputs[index].start_fx(&mut self.wl, t.id, &t.effect, old, &t.new)
+        let started = self.outputs[index].start_fx(
+            &mut self.wl,
+            (t.id, &t.effect),
+            (old, old_player),
+            &t.new,
+            &self.players,
+        );
+        if started {
+            self.wake(index);
+        }
+        started
+    }
+
+    /// Starts the hidden players that the output uses.
+    fn wake(&mut self, index: usize) {
+        if self.paused {
+            return;
+        }
+        let output = &self.outputs[index];
+        let now = now_ns();
+        for p in &mut self.players {
+            if p.deadline.is_none() && output.uses(p.id) {
+                p.deadline = Some(now + p.delay_ns());
+            }
+        }
     }
 
     /// Advances the transitions whose deadline has come, and renders their
-    /// ready outputs. When a transition is complete, its outputs show the wall.
+    /// ready outputs. When a transition is complete, its outputs show the wall,
+    /// and the player of the old wall is removed.
     ///
     /// This is a tick path: there is no allocation and no log, but for the last step.
     fn run_transitions(&mut self) {
@@ -412,7 +468,7 @@ impl Daemon {
             if t.effect.advance() {
                 for o in &mut self.outputs {
                     if o.fx() == Some(t.id) && o.ready() {
-                        o.fx_tick(&mut self.wl, &t.effect, &t.new);
+                        o.fx_tick(&mut self.wl, &t.effect, &t.new, &self.players);
                     }
                 }
                 let late = now - t.deadline > STEP_NS;
@@ -426,6 +482,7 @@ impl Daemon {
                     self.rebuild(index);
                 }
             }
+            self.gc_players();
         }
     }
 
@@ -441,7 +498,8 @@ impl Daemon {
             Some(Spec::Img {
                 path,
                 hash: Some(hash),
-            }) => self.wall_for(&hash, &path).unwrap_or_else(|e| {
+                anchor,
+            }) => self.wall_for(&hash, &path, anchor).unwrap_or_else(|e| {
                 eprintln!("pixelwp: {path}: {e}");
                 Wall::Color(BLACK)
             }),
@@ -460,24 +518,17 @@ impl Daemon {
     fn rebuild(&mut self, index: usize) {
         let output = &mut self.outputs[index];
         let Err(e) = output.rebuild(&mut self.wl, &self.players) else {
-            // A player stops during a transition. It starts again here.
-            let id = output.player();
-            if let Some(p) = self.players.iter_mut().find(|p| Some(p.id) == id)
-                && p.deadline.is_none()
-                && !self.paused
-            {
-                p.deadline = Some(now_ns() + p.delay_ns());
-            }
+            self.wake(index);
             return;
         };
         eprintln!("pixelwp: {}: {e}", output.name);
         // A cache file that became bad is decoded again.
-        if let Wall::Still { hash, path } = &output.wall
+        if let Wall::Still { hash, path, anchor } = &output.wall
             && Cache::open(&cache::path_for(hash)).is_err()
             && let Some(entry) = self.state.lookup(&output.name)
         {
-            let (path, target) = (path.clone(), entry.target.clone());
-            if let Err(e) = self.start_img(&path, &target, None, false, None) {
+            let (path, target, anchor) = (path.clone(), entry.target.clone(), *anchor);
+            if let Err(e) = self.start_img(&path, anchor, &target, None, false, None) {
                 eprintln!("pixelwp: {e}");
             }
         }
@@ -496,14 +547,20 @@ impl Daemon {
         }
     }
 
+    /// Removes the players and the transitions that no output uses. The old
+    /// wall of a transition keeps its player until the transition ends.
+    fn gc_players(&mut self) {
+        let outputs = &self.outputs;
+        self.players
+            .retain(|p| outputs.iter().any(|o| o.uses(p.id)));
+        self.transitions
+            .retain(|t| outputs.iter().any(|o| o.fx() == Some(t.id)));
+    }
+
     /// Removes the players that no output uses, and the cache files that the
     /// state does not use.
     fn gc(&mut self) {
-        let outputs = &self.outputs;
-        self.players
-            .retain(|p| outputs.iter().any(|o| o.player() == Some(p.id)));
-        self.transitions
-            .retain(|t| outputs.iter().any(|o| o.fx() == Some(t.id)));
+        self.gc_players();
         if self.restoring {
             return;
         }
@@ -532,6 +589,7 @@ impl Daemon {
     fn start_img(
         &mut self,
         path: &str,
+        anchor: Anchor,
         target: &str,
         client: Option<u64>,
         persist: bool,
@@ -541,7 +599,7 @@ impl Daemon {
             cache::hash_file(path.as_ref()).map_err(|e| format!("cannot read {path}: {e}"))?;
         let cache_path = cache::path_for(&hash);
         if Cache::open(&cache_path).is_ok() {
-            self.apply_image(target, path, hash, persist, fx);
+            self.apply_image(target, path, anchor, hash, persist, fx);
             return Ok(true);
         }
         _ = std::fs::remove_file(&cache_path);
@@ -574,6 +632,7 @@ impl Daemon {
             stderr,
             hash,
             path: path.to_owned(),
+            anchor,
             target: target.to_owned(),
             client,
             persist,
@@ -587,6 +646,7 @@ impl Daemon {
         &mut self,
         target: &str,
         path: &str,
+        anchor: Anchor,
         hash: Hash,
         persist: bool,
         fx: Option<Kind>,
@@ -595,6 +655,7 @@ impl Daemon {
             let spec = Spec::Img {
                 path: path.to_owned(),
                 hash: Some(hash),
+                anchor,
             };
             self.state.set(target, spec);
             self.state.save();
@@ -602,9 +663,14 @@ impl Daemon {
             // a restore: the line must be the same as at the start of the decode
             match self.state.entries.iter_mut().find(|e| e.target == target) {
                 Some(Entry {
-                    spec: Spec::Img { path: p, hash: h },
+                    spec:
+                        Spec::Img {
+                            path: p,
+                            hash: h,
+                            anchor: a,
+                        },
                     ..
-                }) if p == path => *h = Some(hash),
+                }) if p == path && *a == anchor => *h = Some(hash),
                 _ => return,
             }
         }
@@ -620,7 +686,14 @@ impl Daemon {
         let mut job = self.jobs.swap_remove(index);
         let ok = job.child.wait().is_ok_and(|status| status.success());
         let result = if ok && Cache::open(&cache::path_for(&job.hash)).is_ok() {
-            self.apply_image(&job.target, &job.path, job.hash, job.persist, job.fx);
+            self.apply_image(
+                &job.target,
+                &job.path,
+                job.anchor,
+                job.hash,
+                job.persist,
+                job.fx,
+            );
             Ok(String::new())
         } else {
             let mut text = String::new();
@@ -643,16 +716,18 @@ impl Daemon {
         let mut text = String::new();
         for o in &self.outputs {
             let (w, h) = o.physical();
+            let anchor = match &o.wall {
+                Wall::Color(_) => Anchor::default(),
+                Wall::Still { anchor, .. } | Wall::Anim { anchor, .. } => *anchor,
+            };
             let (what, state) = match &o.wall {
                 Wall::Color(c) => (format!("color #{:06X}", c & 0xFF_FFFF), "static"),
                 Wall::Still { path, .. } => (path.clone(), "static"),
-                Wall::Anim { player, path } => {
-                    // the animation starts after the transition
-                    let playing = o.fx().is_some()
-                        || self
-                            .players
-                            .iter()
-                            .any(|p| p.id == *player && p.deadline.is_some());
+                Wall::Anim { player, path, .. } => {
+                    let playing = self
+                        .players
+                        .iter()
+                        .any(|p| p.id == *player && p.deadline.is_some());
                     let state = match (self.paused, playing) {
                         (true, _) => "paused",
                         (false, true) => "playing",
@@ -661,7 +736,12 @@ impl Daemon {
                     (path.clone(), state)
                 }
             };
-            text += &format!("{} {w}x{h} {what} {state}\n", o.name);
+            text += &format!("{} {w}x{h} {what} {state}", o.name);
+            // the default anchor is not shown
+            if anchor != Anchor::default() {
+                text += &format!(" {}", anchor.name());
+            }
+            text.push('\n');
         }
         text
     }
@@ -707,10 +787,13 @@ impl Daemon {
                 self.gc();
                 ok()
             }
-            ["img", path, target, fx] => {
+            ["img", path, target, fx, anchor] => {
                 let fx = match transition(fx) {
                     Ok(fx) => fx,
                     Err(e) => return Some(Err(e)),
+                };
+                let Some(anchor) = Anchor::parse(anchor) else {
+                    return Some(Err(format!("bad anchor {anchor}")));
                 };
                 if path.contains('\n') {
                     return Some(Err("the path contains a newline".into()));
@@ -718,7 +801,7 @@ impl Daemon {
                 if let Err(e) = self.check_target(target) {
                     return Some(Err(e));
                 }
-                match self.start_img(path, target, Some(client), true, fx) {
+                match self.start_img(path, anchor, target, Some(client), true, fx) {
                     Ok(true) => ok(),
                     Ok(false) => None,
                     Err(e) => Some(Err(e)),
@@ -816,8 +899,10 @@ impl Daemon {
             let id = Some(p.id);
             // An output is ready when the frame callback of its last commit has arrived.
             // With no ready output, the player is hidden: it has no deadline.
-            let any_ready = self.outputs.iter().any(|o| o.playing() == id && o.ready());
-            if !any_ready || p.advance().is_err() {
+            // A transition draws the frames at its steps, also on an output that
+            // is not ready.
+            let shown = |o: &Output| o.uses(p.id) && (o.fx().is_some() || o.ready());
+            if !self.outputs.iter().any(shown) || p.advance().is_err() {
                 p.deadline = None;
                 continue;
             }
@@ -1168,17 +1253,17 @@ fn run_inner() -> Result<i32, String> {
     }
 
     // restore the state: find the cache file of each image, or decode it again
-    let images: Vec<(String, String)> = daemon
+    let images: Vec<(String, String, Anchor)> = daemon
         .state
         .entries
         .iter()
         .filter_map(|e| match &e.spec {
-            Spec::Img { path, .. } => Some((e.target.clone(), path.clone())),
+            Spec::Img { path, anchor, .. } => Some((e.target.clone(), path.clone(), *anchor)),
             Spec::Color(_) => None,
         })
         .collect();
-    for (target, path) in images {
-        if let Err(e) = daemon.start_img(&path, &target, None, false, None) {
+    for (target, path, anchor) in images {
+        if let Err(e) = daemon.start_img(&path, anchor, &target, None, false, None) {
             eprintln!("pixelwp: {e}");
         }
     }
@@ -1347,15 +1432,16 @@ mod tests {
 
     #[test]
     fn state_round_trip() {
-        let text = "all img /home/u/a b.gif\nDP-1 color ff8800\nbad line\nDP-2 what x\nDP-1 color 000001\n";
+        let text = "all img /home/u/a b.gif\nDP-1 color ff8800\nbad line\nDP-2 what x\nDP-1 color 000001\n\
+                    DP-3 img topleft /c d.png\nDP-4 img nowhere /e.png\n";
         let mut state = State {
             entries: State::parse(text),
             path: PathBuf::new(),
         };
-        assert_eq!(state.entries.len(), 2);
+        assert_eq!(state.entries.len(), 3);
         assert_eq!(
             state.format(),
-            "all img /home/u/a b.gif\nDP-1 color 000001\n"
+            "all img center /home/u/a b.gif\nDP-1 color 000001\nDP-3 img topleft /c d.png\n"
         );
         assert_eq!(State::parse(&state.format()), state.entries);
 
@@ -1364,7 +1450,7 @@ mod tests {
         assert_eq!(state.lookup("HDMI-A-1").unwrap().target, "all");
 
         state.set("DP-1", Spec::Color(BLACK));
-        assert_eq!(state.entries.len(), 2);
+        assert_eq!(state.entries.len(), 3);
         // `all` replaces all lines
         state.set("all", Spec::Color(BLACK));
         assert_eq!(state.format(), "all color 000000\n");
