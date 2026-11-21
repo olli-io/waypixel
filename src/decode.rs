@@ -12,7 +12,7 @@ use image::{AnimationDecoder, DynamicImage, Frames, ImageDecoder, ImageFormat, I
 
 use crate::cache::{MAX_SIDE, Writer};
 use crate::diff::{Differ, Rect};
-use crate::pixelart::{factor, holds, shrink};
+use crate::pixelart::{MAX_1X_SIDE, NOT_PIXEL_ART, Palette, factor, holds, shrink};
 
 /// Frame delays under this value are replaced by `DEFAULT_DELAY_MS`.
 const MIN_DELAY_MS: u32 = 20;
@@ -100,6 +100,8 @@ struct Encoder<'a> {
     /// block size; 0 = not known yet
     n: u32,
     size: (u32, u32),
+    /// the colours of all frames; used only when N = 1
+    palette: Palette,
     writer: Option<Writer>,
     prev: Vec<u32>,
     differ: Differ,
@@ -117,6 +119,10 @@ impl Encoder<'_> {
         let n = self.n;
         if !holds(&xrgb, w, h, n) {
             return Ok(Some(factor(&xrgb, w, h, n)));
+        }
+        // N = 1: only small art with few colours is pixel art
+        if n == 1 && !(w.max(h) <= MAX_1X_SIDE && self.palette.add(&xrgb)) {
+            return Err(NOT_PIXEL_ART.into());
         }
         let small = if n > 1 { shrink(&xrgb, w, h, n) } else { xrgb };
         let (sw, sh) = (w / n, h / n);
@@ -138,8 +144,6 @@ impl Encoder<'_> {
             .diff(&self.prev, &small, sw as usize, sh as usize);
         if rects.is_empty() {
             writer.add_delay(delay_ms);
-        } else if n == 1 {
-            return Err("animation is not pixel art".into());
         } else {
             writer.add_frame(delay_ms, &rects, &small).map_err(e)?;
             self.prev = small;
@@ -153,6 +157,7 @@ fn pass(src: &Path, dst: &Path, n: u32) -> Result<Pass, String> {
         dst,
         n,
         size: (0, 0),
+        palette: Palette::default(),
         writer: None,
         prev: Vec::new(),
         differ: Differ::default(),
@@ -176,10 +181,9 @@ fn pass(src: &Path, dst: &Path, n: u32) -> Result<Pass, String> {
             }
         }
     }
-    let n = enc.n;
     let writer = enc.writer.ok_or("image has no frames")?;
     writer
-        .finish(n > 1)
+        .finish()
         .map_err(|e| format!("cannot write cache file: {e}"))?;
     Ok(Pass::Done)
 }
@@ -267,8 +271,7 @@ pub mod tests {
             write_gif(&gif, &big, (w * n) as u32, (h * n) as u32);
             run(&gif, &pwp).unwrap();
             let cache = Cache::open(&pwp).unwrap();
-            assert!(cache.pixel_art);
-            assert_eq!((cache.w as usize, cache.h as usize), (w, h));
+                assert_eq!((cache.w as usize, cache.h as usize), (w, h));
             assert_eq!(replay(&cache), art);
             assert!((0..cache.frame_count()).all(|i| cache.delay_ms(i) == 70));
             // no temp file stays
@@ -320,18 +323,46 @@ pub mod tests {
     }
 
     #[test]
-    fn animation_that_is_not_pixel_art_is_rejected() {
-        let mut rng = Rng(5);
-        let f0: Vec<u32> = (0..16 * 16)
-            .map(|_| 0xFF00_0000 | (rng.below(4) * 60))
-            .collect();
-        let mut f1 = f0.clone();
-        f1[7] ^= 0x0000_8000;
-        let gif = temp("noise.gif");
-        let pwp = temp("noise.pwp");
-        write_gif(&gif, &[(f0, 100), (f1, 100)], 16, 16);
-        assert_eq!(run(&gif, &pwp).err().unwrap(), "animation is not pixel art");
+    fn image_that_is_not_pixel_art_is_rejected() {
+        // too many colours: 2 frames of 200 colours each
+        let f0: Vec<u32> = (0..200).map(|i| 0xFF00_0000 | i).collect();
+        let f1: Vec<u32> = (0..200).map(|i| 0xFF00_8000 | i).collect();
+        let gif = temp("colours.gif");
+        let pwp = temp("colours.pwp");
+        write_gif(&gif, &[(f0, 100), (f1, 100)], 20, 10);
+        assert_eq!(run(&gif, &pwp).err().unwrap(), NOT_PIXEL_ART);
         assert!(!pwp.exists());
+
+        // too large for art stored at 1×
+        let w = MAX_1X_SIDE + 1;
+        let f0 = art_frames(w as usize, 3, 2, 5);
+        let gif = temp("large.gif");
+        let pwp = temp("large.pwp");
+        write_gif(&gif, &[(f0[0].clone(), 100), (f0[1].clone(), 100)], w, 3);
+        assert_eq!(run(&gif, &pwp).err().unwrap(), NOT_PIXEL_ART);
+        assert!(!pwp.exists());
+    }
+
+    /// Art stored at 1× (N = 1): small, with few colours.
+    #[test]
+    fn art_at_1x() {
+        let (w, h) = (23, 17);
+        let art = art_frames(w, h, 6, 21);
+        let frames: Vec<(Vec<u32>, u32)> = art.iter().map(|f| (f.clone(), 80)).collect();
+        let gif = temp("1x.gif");
+        let pwp = temp("1x-gif.pwp");
+        write_gif(&gif, &frames, w as u32, h as u32);
+        run(&gif, &pwp).unwrap();
+        let cache = Cache::open(&pwp).unwrap();
+        assert_eq!((cache.w as usize, cache.h as usize), (w, h));
+        assert_eq!(replay(&cache), art);
+
+        let png = temp("1x.png");
+        let pwp = temp("1x-png.pwp");
+        to_rgba(&art[0], w as u32, h as u32).save(&png).unwrap();
+        run(&png, &pwp).unwrap();
+        let cache = Cache::open(&pwp).unwrap();
+        assert_eq!(replay(&cache)[0], art[0]);
     }
 
     #[test]
@@ -343,11 +374,10 @@ pub mod tests {
         to_rgba(&v, w, h).save(&png).unwrap();
         run(&png, &pwp).unwrap();
         let cache = Cache::open(&pwp).unwrap();
-        assert!(cache.pixel_art);
         assert_eq!((cache.w, cache.h, cache.frame_count()), (6, 5, 1));
         assert_eq!(replay(&cache)[0], checker(6, 5));
 
-        // normal image: stored at full size, not pixel art
+        // normal image: rejected
         let mut rng = Rng(6);
         let v: Vec<u32> = (0..31 * 17)
             .map(|_| 0xFF00_0000 | rng.next() >> 8)
@@ -355,11 +385,8 @@ pub mod tests {
         let png = temp("photo.png");
         let pwp = temp("photo.pwp");
         to_rgba(&v, 31, 17).save(&png).unwrap();
-        run(&png, &pwp).unwrap();
-        let cache = Cache::open(&pwp).unwrap();
-        assert!(!cache.pixel_art);
-        assert_eq!((cache.w, cache.h, cache.frame_count()), (31, 17, 1));
-        assert_eq!(replay(&cache)[0], v);
+        assert_eq!(run(&png, &pwp).err().unwrap(), NOT_PIXEL_ART);
+        assert!(!pwp.exists());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! One output: its surface, viewport, scale, and the Target that draws the wallpaper.
 
-use waybackend::types::{ObjectId, WlFixed};
+use waybackend::types::ObjectId;
 
 use super::player::Player;
 use super::pool::{MAX_BUFFERS, Pool};
@@ -235,7 +235,7 @@ impl Output {
     /// On error, the output shows black and the wall does not change.
     pub fn rebuild(&mut self, wl: &mut Wl, players: &[Player]) -> Result<(), String> {
         self.dirty = false;
-        let Some((lw, lh)) = self.logical else {
+        let Some(_) = self.logical else {
             return Ok(());
         };
         if let Some(pool) = self.pool.take() {
@@ -245,10 +245,10 @@ impl Output {
         self.geom = None;
         self.last_committed = None;
         self.fx = None;
-        let result = self.build(wl, players, (lw, lh));
+        let result = self.build(wl, players);
         if result.is_err() {
             let black = self.color_pool(wl, 0xFF00_0000);
-            self.commit_full(wl, black, None, false);
+            self.commit_full(wl, black, false);
         }
         result
     }
@@ -263,40 +263,27 @@ impl Output {
         &mut self,
         wl: &mut Wl,
         players: &[Player],
-        logical: (u32, u32),
     ) -> Result<(), String> {
         let (pw, ph) = self.physical();
         let shm = |e: rustix::io::Errno| format!("cannot create a shm buffer: {e}");
         match &self.wall {
             Wall::Color(color) => {
                 let pool = self.color_pool(wl, *color);
-                self.commit_full(wl, pool, None, false);
+                self.commit_full(wl, pool, false);
             }
             Wall::Still { hash, anchor, .. } => {
                 let cache = Cache::open(&crate::cache::path_for(hash))?;
-                if cache.pixel_art {
-                    let mut canvas = vec![0u32; cache.w as usize * cache.h as usize];
-                    cache.apply(0, &mut canvas, &mut [])?;
-                    let g = Geom::new((cache.w, cache.h), (pw, ph), *anchor);
-                    let mut pool = Pool::new(wl, pw, ph).map_err(shm)?;
-                    upscale_rect(
-                        &canvas,
-                        pool.pixels(0),
-                        &g,
-                        Rect::new(0, 0, cache.w, cache.h),
-                    );
-                    self.commit_full(wl, Some(pool), None, false);
-                } else {
-                    // aspect fill: the compositor scales the stored image
-                    let mut pool = Pool::new(wl, cache.w, cache.h).map_err(shm)?;
-                    if let Err(e) = cache.apply(0, pool.pixels(0), &mut []) {
-                        // not a plain drop: the fd of the pool is in the message buffer
-                        pool.destroy(wl);
-                        return Err(e);
-                    }
-                    let crop = fill_crop((cache.w, cache.h), logical, *anchor);
-                    self.commit_full(wl, Some(pool), Some(crop), false);
-                }
+                let mut canvas = vec![0u32; cache.w as usize * cache.h as usize];
+                cache.apply(0, &mut canvas, &mut [])?;
+                let g = Geom::new((cache.w, cache.h), (pw, ph), *anchor);
+                let mut pool = Pool::new(wl, pw, ph).map_err(shm)?;
+                upscale_rect(
+                    &canvas,
+                    pool.pixels(0),
+                    &g,
+                    Rect::new(0, 0, cache.w, cache.h),
+                );
+                self.commit_full(wl, Some(pool), false);
             }
             Wall::Anim { player, anchor, .. } => {
                 let player = players
@@ -309,20 +296,17 @@ impl Output {
                 pool.bufs[0].holds = Some(player.seq);
                 self.geom = Some(g);
                 self.last_committed = Some(player.seq);
-                self.commit_full(wl, Some(pool), None, true);
+                self.commit_full(wl, Some(pool), true);
             }
         }
         Ok(())
     }
 
     /// Attaches buffer 0 of the pool with full damage and commits.
-    ///
-    /// `crop` is the viewport source in 1/256 of a buffer pixel: (x, y, w, h).
     fn commit_full(
         &mut self,
         wl: &mut Wl,
         pool: Option<Pool>,
-        crop: Option<[i32; 4]>,
         frame: bool,
     ) {
         let Some(mut pool) = pool else {
@@ -331,9 +315,6 @@ impl Output {
         let Some((lw, lh)) = self.logical else {
             return;
         };
-        let fixed = |v: i32| WlFixed::from(v as f64 / 256.0);
-        let [x, y, w, h] = crop.map_or([WlFixed::from(-1); 4], |c| c.map(fixed));
-        req!(wl, wp_viewport::req::set_source(self.viewport, x, y, w, h));
         req!(
             wl,
             wp_viewport::req::set_destination(self.viewport, lw as i32, lh as i32)
@@ -457,7 +438,7 @@ impl Output {
         };
         effect.render(pool.pixels(0), &fx.geom, &layers, None);
         self.fx = Some(fx);
-        self.commit_full(wl, Some(pool), None, true);
+        self.commit_full(wl, Some(pool), true);
         true
     }
 
@@ -599,69 +580,5 @@ impl Output {
         req!(wl, zwlr_layer_surface_v1::req::destroy(self.layer_surface));
         req!(wl, wl_surface::req::destroy(self.surface));
         req!(wl, wl_output::req::release(self.wl_output));
-    }
-}
-
-/// Aspect-fill crop of a `buf` image for a `logical` surface, in 1/256 of a
-/// buffer pixel: (x, y, w, h). The rect is always inside the buffer. `anchor`
-/// sets the part of the image that the rect keeps.
-pub fn fill_crop(buf: (u32, u32), logical: (u32, u32), anchor: Anchor) -> [i32; 4] {
-    let (bw, bh) = (buf.0 as u64 * 256, buf.1 as u64 * 256);
-    let (lw, lh) = (logical.0.max(1) as u64, logical.1.max(1) as u64);
-    let (cw, ch) = if bw * lh > bh * lw {
-        // the image is wider than the surface: cut left and right
-        ((bh * lw / lh).clamp(1, bw), bh)
-    } else {
-        (bw, (bw * lh / lw).clamp(1, bh))
-    };
-    let (x, y) = anchor.offset((bw - cw, bh - ch));
-    [x, y, cw, ch].map(|v| v as i32)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fill_crop_table() {
-        let center = Anchor::default();
-        let fill_crop = |b, l| super::fill_crop(b, l, center);
-        // same aspect: no crop
-        assert_eq!(
-            fill_crop((1920, 1080), (1280, 720)),
-            [0, 0, 1920 * 256, 1080 * 256]
-        );
-        // wider image: cut the sides
-        assert_eq!(
-            fill_crop((4000, 1000), (1000, 1000)),
-            [1500 * 256, 0, 1000 * 256, 1000 * 256]
-        );
-        // taller image: cut top and bottom
-        assert_eq!(
-            fill_crop((1000, 3000), (2000, 1000)),
-            [0, 1250 * 256, 1000 * 256, 500 * 256]
-        );
-        // an anchor moves the rect to an edge
-        let at = |b, l, name| super::fill_crop(b, l, Anchor::parse(name).unwrap());
-        assert_eq!(at((4000, 1000), (1000, 1000), "left")[0], 0);
-        assert_eq!(
-            at((4000, 1000), (1000, 1000), "bottomright")[..2],
-            [3000 * 256, 0]
-        );
-        assert_eq!(at((1000, 3000), (2000, 1000), "top")[..2], [0, 0]);
-        assert_eq!(
-            at((1000, 3000), (2000, 1000), "bottom")[..2],
-            [0, 2500 * 256]
-        );
-        // the rect stays inside the buffer for odd sizes
-        for (b, l) in [
-            ((1, 1), (3840, 2160)),
-            ((16384, 3), (7, 5000)),
-            ((333, 777), (1707, 1067)),
-        ] {
-            let [x, y, w, h] = fill_crop(b, l);
-            assert!(x >= 0 && y >= 0 && w > 0 && h > 0);
-            assert!(x + w <= b.0 as i32 * 256 && y + h <= b.1 as i32 * 256);
-        }
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! A session lock hides the wallpaper surface. A lock screen can show this file.
 //! Pixel art is written at the size of the output, with the integer scale of
-//! the daemon. Other images are written at their stored size.
+//! the daemon.
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -55,9 +55,6 @@ fn render(line: &Line) -> Result<(Vec<u32>, u32, u32), String> {
     let mut canvas = vec![0u32; cache.w as usize * cache.h as usize];
     let mut scratch = vec![0u8; cache.scratch_len];
     cache.apply(0, &mut canvas, &mut scratch)?;
-    if !cache.pixel_art {
-        return Ok((canvas, cache.w, cache.h));
-    }
     let (sw, sh) = line.size;
     if sw == 0 || sh == 0 {
         return Err(format!("output {} has no size", line.name));

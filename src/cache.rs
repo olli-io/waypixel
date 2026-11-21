@@ -2,7 +2,7 @@
 //!
 //! All values are little-endian.
 //! ```text
-//! Header (32 B): u32 magic 'PXWP', u16 version, u16 flags (bit0 pixelArt),
+//! Header (32 B): u32 magic 'PXWP', u16 version, u16 flags (0),
 //!                u32 width, u32 height, u32 frameCount, u32 reserved, u64 indexOffset
 //! Payload: LZ4 blocks, 16-byte aligned
 //! Index (frameCount entries): u32 delayMs, u32 rectCount,
@@ -21,7 +21,7 @@ use crate::diff::{MAX_RECTS, Rect};
 compile_error!("pixelwp supports little-endian targets only");
 
 const MAGIC: [u8; 4] = *b"PXWP";
-const VERSION: u16 = 1;
+const VERSION: u16 = 3;
 const HEADER: usize = 32;
 const ALIGN: u64 = 16;
 /// Maximum image size per side.
@@ -169,7 +169,7 @@ impl Writer {
     }
 
     /// Writes the index and the header, syncs, and renames to the final name.
-    pub fn finish(mut self, pixel_art: bool) -> io::Result<()> {
+    pub fn finish(mut self) -> io::Result<()> {
         let index_offset = self.pos;
         for (delay, rects) in &self.frames {
             self.file.write_all(&delay.to_le_bytes())?;
@@ -185,7 +185,7 @@ impl Writer {
         let mut header = Vec::with_capacity(HEADER);
         header.extend_from_slice(&MAGIC);
         header.extend_from_slice(&VERSION.to_le_bytes());
-        header.extend_from_slice(&(pixel_art as u16).to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes());
         header.extend_from_slice(&(self.w as u32).to_le_bytes());
         header.extend_from_slice(&(self.h as u32).to_le_bytes());
         header.extend_from_slice(&(self.frames.len() as u32).to_le_bytes());
@@ -227,7 +227,6 @@ pub struct Cache {
     len: usize,
     pub w: u32,
     pub h: u32,
-    pub pixel_art: bool,
     frames: Vec<Frame>,
     entries: Vec<Entry>,
     /// byte size of the largest rect that is not full-width
@@ -278,7 +277,6 @@ impl Cache {
             len,
             w: 0,
             h: 0,
-            pixel_art: false,
             frames: Vec::new(),
             entries: Vec::new(),
             scratch_len: 0,
@@ -301,7 +299,7 @@ impl Cache {
         if c.u16()? != VERSION {
             return Err("bad version".into());
         }
-        let flags = c.u16()?;
+        let _flags = c.u16()?;
         let (w, h) = (c.u32()?, c.u32()?);
         let frame_count = c.u32()? as usize;
         let _reserved = c.u32()?;
@@ -367,7 +365,6 @@ impl Cache {
         }
         self.w = w;
         self.h = h;
-        self.pixel_art = flags & 1 != 0;
         self.frames = frames;
         self.entries = entries;
         self.scratch_len = scratch_len;
@@ -484,7 +481,7 @@ pub mod tests {
                 writer.add_frame(delay, &rects, &pair[1]).unwrap();
             }
         }
-        writer.finish(true).unwrap();
+        writer.finish().unwrap();
     }
 
     #[test]
@@ -495,7 +492,6 @@ pub mod tests {
             write(&path, &frames, w, h, 50);
             let cache = Cache::open(&path).unwrap();
             assert_eq!((cache.w as usize, cache.h as usize), (w, h));
-            assert!(cache.pixel_art);
             assert_eq!(cache.frame_count(), frames.len());
             let mut canvas = vec![0u32; w * h];
             let mut scratch = vec![0u8; cache.scratch_len];
@@ -538,7 +534,7 @@ pub mod tests {
         assert_eq!(Cache::open(&path).err().unwrap(), "bad magic");
 
         let mut bad = good.clone();
-        bad[4] = 2;
+        bad[4] = 9;
         std::fs::write(&path, &bad).unwrap();
         assert_eq!(Cache::open(&path).err().unwrap(), "bad version");
 

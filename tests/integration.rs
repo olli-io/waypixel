@@ -638,6 +638,8 @@ impl Env {
             .env("XDG_STATE_HOME", self.dir.join("state"))
             .env("XDG_CONFIG_HOME", self.dir.join("config"))
             .env("WAYLAND_DISPLAY", "wayland-test")
+            // a `notify-send` of the test can be in `bin`; the real one is never used
+            .env("PATH", self.dir.join("bin"))
             .env_remove("WAYLAND_SOCKET");
         cmd
     }
@@ -1082,36 +1084,36 @@ fn full_session() {
     );
     assert_eq!(env.cache_files().len(), 2);
 
-    // -- normal still: stored size, aspect fill by the viewport
+    // -- an image that is not pixel art: an error and a notification
     let mut rng = Rng(9);
     let photo = image::RgbaImage::from_fn(90, 40, |_, _| {
         image::Rgba([rng.below(256) as u8, rng.below(256) as u8, 7, 255])
     });
-    let jpg_like = env.dir.join("photo.png");
-    photo.save(&jpg_like).unwrap();
-    let photo_path = jpg_like.to_str().unwrap();
-    env.ok(&["img", photo_path, "-o", "HDMI-A-1"]);
+    let photo_path = env.dir.join("photo.png");
+    photo.save(&photo_path).unwrap();
     {
-        let want: Vec<u32> = photo
-            .pixels()
-            .map(|p| 0xFF00_0000 | (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32)
-            .collect();
-        assert_eq!(env.texture(1), (want, (90, 40)));
-        let mock = env.mock();
-        let s = mock.surface_of_output(1).unwrap();
-        // 90×40 on 256×144 (16:9): the crop is 71.1 × 40, centred
-        let [x, y, cw, ch] = s.src.unwrap();
-        assert_eq!((y, ch, s.dst), (0, 40 * 256, Some((256, 144))));
-        assert_eq!(cw, 40 * 256 * 256 / 144);
-        assert_eq!(x, (90 * 256 - cw) / 2);
+        use std::os::unix::fs::PermissionsExt;
+        let bin = env.dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+            env.dir.join("notified").display()
+        );
+        std::fs::write(bin.join("notify-send"), script).unwrap();
+        let mode = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(bin.join("notify-send"), mode).unwrap();
     }
-    env.ok(&["img", photo_path, "-o", "HDMI-A-1", "--anchor", "right"]);
-    {
-        let [x, y, cw, _] = env.mock().surface_of_output(1).unwrap().src.unwrap();
-        assert_eq!((x, y), (90 * 256 - cw, 0));
-    }
-    env.ok(&["img", photo_path, "-o", "HDMI-A-1"]);
-    // the cache file of the old still is deleted
+    let (code, _, stderr) = env.cli(&["img", photo_path.to_str().unwrap(), "-o", "HDMI-A-1"]);
+    assert_eq!(
+        (code, stderr.trim()),
+        (1, "pixelwp: the image is not true pixel art")
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.dir.join("notified")).unwrap(),
+        "--app-name=pixelwp\npixelwp\nphoto.png: the image is not true pixel art\n"
+    );
+    std::fs::remove_file(env.dir.join("notified")).unwrap();
+    env.ok(&["img", png, "-o", "HDMI-A-1"]);
     assert_eq!(env.cache_files().len(), 2);
     wait("still buffer destroyed", || env.mock().live_buffers == 1);
 
@@ -1124,20 +1126,22 @@ fn full_session() {
     let (code, _, _) = env.cli(&["img", "/nonexistent/file.gif"]);
     assert_eq!(code, 1);
     let noise = env.dir.join("noise.gif");
-    let n0: Vec<u32> = (0..32 * 32)
+    // N = 1, and too wide for art stored at 1×
+    let n0: Vec<u32> = (0..641 * 4)
         .map(|_| COLOURS[rng.below(4) as usize])
         .collect();
     let mut n1 = n0.clone();
     n1[5] = 0xFFFF_FFFF;
-    write_gif(&noise, &[n0, n1], 32, 32, 1, 50);
+    write_gif(&noise, &[n0, n1], 641, 4, 1, 50);
     let (code, _, stderr) = env.cli(&["img", noise.to_str().unwrap()]);
     assert_eq!(
         (code, stderr.trim()),
-        (1, "pixelwp: animation is not pixel art")
+        (1, "pixelwp: the image is not true pixel art")
     );
+    assert!(env.dir.join("notified").exists());
     assert_eq!(
         env.ok(&["query"]),
-        format!("DP-1 300x200 {gif} playing\nHDMI-A-1 384x216 {photo_path} static\n")
+        format!("DP-1 300x200 {gif} playing\nHDMI-A-1 384x216 {png} static\n")
     );
     assert_eq!(env.cache_files().len(), 2);
 
@@ -1146,7 +1150,7 @@ fn full_session() {
     let state = std::fs::read_to_string(env.dir.join("state/pixelwp/state")).unwrap();
     assert_eq!(
         state,
-        format!("all img center {gif}\nHDMI-A-1 img center {photo_path}\n")
+        format!("all img center {gif}\nHDMI-A-1 img center {png}\n")
     );
     env.ok(&["kill"]);
     assert_eq!(env.daemon.take().unwrap().wait().unwrap().code(), Some(0));
@@ -1157,7 +1161,7 @@ fn full_session() {
     env.start_daemon();
     wait("restore", || {
         env.ok(&["query"])
-            == format!("DP-1 400x225 {gif} playing\nHDMI-A-1 384x216 {photo_path} static\n")
+            == format!("DP-1 400x225 {gif} playing\nHDMI-A-1 384x216 {png} static\n")
     });
     wait("restored frames", || {
         env.mock()
@@ -1165,7 +1169,7 @@ fn full_session() {
             .is_some_and(|s| s.tex_size == phys[0])
     });
     shown_frame(&env, 0, &refs[0]);
-    assert_eq!(env.texture(1).1, (90, 40));
+    assert_eq!(env.texture(1).1, phys[1]);
     assert_eq!(env.cache_files().len(), 2);
 
     // -- an output goes away; SIGTERM is a clean exit

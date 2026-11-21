@@ -5,7 +5,10 @@ compositors (compositors with `zwlr_layer_shell_v1`: Sway, Hyprland, river, niri
 
 - Pixel art (GIF, APNG, animated WebP, or a still) always gets an integer scale.
   The image is centred and the overflow is cut.
-- Other images are stills only. The compositor scales them (aspect fill).
+- An image is pixel art when it is an integer upscale (2× or more), or when it
+  is small (no side longer than 640 px) and has 256 colours or fewer.
+- Other images are rejected: `pixelwp img` prints an error and shows a desktop
+  notification (with `notify-send`, if it is installed).
 - The daemon keeps the art at 1× and draws only the changed areas on each frame.
 - The animation stops when the compositor does not show the wallpaper.
 
@@ -69,8 +72,7 @@ transition = sweep
 ```
 
 The daemon reads the file at each change, so no restart is necessary. `--fx <name>`
-has priority over the file. There is no transition when the old or the new
-image is not pixel art.
+has priority over the file.
 
 An animation plays during the transition, for the old and for the new
 wallpaper.

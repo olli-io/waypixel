@@ -3,6 +3,40 @@
 //! An image is pixel art when every aligned N×N block has one colour, with N > 1.
 //! N is the GCD of all run lengths of equal pixels, along rows and columns. Runs
 //! that touch the edge count too, so N always divides the width and the height.
+//!
+//! An image with N = 1 is pixel art stored at 1× when it is small and has few
+//! colours: see `MAX_1X_SIDE` and `Palette`.
+
+use std::collections::HashSet;
+
+/// The decode error for an image that is not pixel art.
+pub const NOT_PIXEL_ART: &str = "the image is not true pixel art";
+
+/// Art stored at 1× has no side longer than this.
+pub const MAX_1X_SIDE: u32 = 640;
+/// Art stored at 1× has no more colours than this, counted across all frames.
+pub const MAX_1X_COLOURS: usize = 256;
+
+/// The colours of the frames of an image, counted up to `MAX_1X_COLOURS`.
+#[derive(Default)]
+pub struct Palette(HashSet<u32>);
+
+impl Palette {
+    /// Adds the colours of `buf`. False when there are too many colours.
+    pub fn add(&mut self, buf: &[u32]) -> bool {
+        let mut last = None;
+        for p in buf {
+            if last != Some(*p) {
+                last = Some(*p);
+                self.0.insert(*p);
+                if self.0.len() > MAX_1X_COLOURS {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
 
 /// GCD of all run lengths of equal pixels in rows and columns.
 ///
@@ -200,6 +234,17 @@ pub mod tests {
         assert!(!holds(&v, w, h, 4));
         assert_eq!(factor(&v, w, h, 4), 2);
         assert!(holds(&v, w, h, 2));
+    }
+
+    #[test]
+    fn palette_limit() {
+        let mut p = Palette::default();
+        let a: Vec<u32> = (0..200).collect();
+        assert!(p.add(&a));
+        assert!(p.add(&a));
+        let b: Vec<u32> = (144..256).collect();
+        assert!(p.add(&b));
+        assert!(!p.add(&[256]));
     }
 
     #[test]

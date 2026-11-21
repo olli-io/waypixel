@@ -355,15 +355,12 @@ impl Daemon {
         Ok(anim(id))
     }
 
-    /// The 1× image of a wall. `None` for an image that is not pixel art.
+    /// The 1× image of a wall. `None` when the cache file or the player is not there.
     fn canvas_of(&self, wall: &Wall) -> Option<Canvas> {
         match wall {
             Wall::Color(color) => Some(Canvas::color(*color)),
             Wall::Still { hash, anchor, .. } => {
                 let cache = Cache::open(&cache::path_for(hash)).ok()?;
-                if !cache.pixel_art {
-                    return None;
-                }
                 let mut px = vec![0u32; cache.w as usize * cache.h as usize];
                 cache.apply(0, &mut px, &mut []).ok()?;
                 Some(Canvas {
@@ -387,7 +384,7 @@ impl Daemon {
     }
 
     /// Starts a transition from `old` to the wall of the output. Returns
-    /// false when there is no transition: one of the images is not pixel art.
+    /// false when there is no transition: an image is not there.
     fn start_fx(&mut self, index: usize, old: &Wall, kind: Kind) -> bool {
         let old_player = match old {
             Wall::Anim { player, .. } => Some(*player),

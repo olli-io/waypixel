@@ -12,8 +12,8 @@ pixelwp is a new, minimal rewrite in a new repo, `~/git/pixelwp`. It drops trans
 
 User decisions:
 - Pixel art always gets an integer scale, with no aspect-fill fallback. The overflow is cut. This differs from macawww, which falls back to aspect fill when k > 1.25 × the fill scale.
-- Other images are stills only. They use aspect fill done by the compositor through `wp_viewporter`, which filters smoothly on the GPU.
-- No D-Bus. The only pause signals are missing frame callbacks (`hidden`) and manual `pause`.
+- Other images are rejected. The client prints the error and runs `notify-send` to show a desktop notification. If `notify-send` is not installed, there is no notification.
+- No D-Bus in pixelwp. The only pause signals are missing frame callbacks (`hidden`) and manual `pause`.
 
 ---
 
@@ -21,7 +21,7 @@ User decisions:
 Goal: the lowest CPU, RAM and power use for animated pixel-art wallpapers on wlroots-type compositors (that is, compositors with `zwlr_layer_shell_v1`).
 
 Non-goals (v1):
-- Animations that are not pixel art.
+- Images and animations that are not pixel art.
 - Playlists, filters, resize modes, namespaces. Transitions other than those of §9a.
 - SVG, JXL, video.
 - A file picker, an installer, a man page. A config file with more than the `transition` key.
@@ -59,7 +59,7 @@ file ─(child: image crate)─▶ pixel-art detect ─▶ 1× frames ─▶ til
 | `pixelwp img <path> [--output <name\|all>] [--fx <name>] [--anchor <name>]` | Set the wallpaper. Default `all`. `--fx`: see §9a. `--anchor`: see §8. |
 | `pixelwp clear [--color <hex>] [--output ...] [--fx ...]` | Solid colour. Default `000000`. |
 | `pixelwp query` | One line per output: `<name> <w>x<h> <file\|color #RRGGBB> <state> [<anchor>]`. The anchor is shown only when it is not `center`. |
-| `pixelwp still <file.png> [--output <name>]` | Write frame 0 of one output as a PNG. Default: the largest output. The client does this: it reads `query` and the cache file. Pixel art has the output size and the integer scale; other images have the stored size; a colour is 1×1. |
+| `pixelwp still <file.png> [--output <name>]` | Write frame 0 of one output as a PNG. Default: the largest output. The client does this: it reads `query` and the cache file. An image has the output size and the integer scale; a colour is 1×1. |
 | `pixelwp pause` / `resume` | Manual pause. |
 | `pixelwp kill` | Stop the daemon. |
 
@@ -88,7 +88,7 @@ file ─(child: image crate)─▶ pixel-art detect ─▶ 1× frames ─▶ til
    - N = the GCD of all run lengths of equal pixels in the rows and columns of frame 0.
    - If N > 1, keep one pixel per N×N block.
    - Check each later frame with `holds(N)`. If a frame fails, set N = `factor(frame, limit = N)` and restart the decode.
-   - If N reaches 1, the image is not pixel art. An animation that is not pixel art is an error.
+   - If N reaches 1, the image is pixel art stored at 1× when no side is longer than 640 px and all frames together have 256 colours or fewer. If not, the image is not pixel art, which is the error `the image is not true pixel art`.
 6. Diff each frame against the previous one in tiles of T = 8 (1× coordinates).
    - Merge the changed tiles into at most 8 rects: first row runs, then vertical merge, then a bounding-box merge of the smallest pairs (as in macawww `Diff.swift`).
    - If the dirty area is more than 50 % of the frame, store one full-frame rect.
@@ -100,8 +100,8 @@ file ─(child: image crate)─▶ pixel-art detect ─▶ 1× frames ─▶ til
 ## 7. Cache file `.pwp`
 Path: `$XDG_CACHE_HOME/pixelwp/<sha256-hex>.pwp`. All values are little-endian.
 ```
-Header (32 B): u32 magic 'PXWP', u16 version 1, u16 flags (bit0 pixelArt),
-               u32 width, u32 height   (stored size: 1× for pixel art)
+Header (32 B): u32 magic 'PXWP', u16 version 3, u16 flags (0),
+               u32 width, u32 height   (stored size: 1×)
                u32 frameCount, u32 reserved (0), u64 indexOffset
 Payload: LZ4 blocks, 16-byte aligned
 Index (frameCount entries): u32 delayMs, u32 rectCount,
@@ -126,9 +126,6 @@ Index (frameCount entries): u32 delayMs, u32 rectCount,
   - The viewport destination is the logical size, so 1 buffer pixel = 1 panel pixel.
   - k = `max(1, ceil(W/w), ceil(H/h))`.
   - The offset is `ox = (k·w − W)·ax/2` and `oy = (k·h − H)·ay/2`, with integer division. The anchor gives `ax` and `ay`: 0 = left / top, 1 = centre, 2 = right / bottom.
-- **Other stills (aspect fill):**
-  - The buffer is the stored size. The daemon decompresses frame 0 straight into it.
-  - The viewport source is the aspect-fill crop rect in `wl_fixed`, and the destination is the logical size. The compositor scales with its normal filter. The anchor moves the crop rect as it moves the offset of pixel art.
 - **Anchor:** `--anchor <center|top|bottom|left|right|topleft|topright|bottomleft|bottomright>`. The default is `center`. `top-left` and `top_left` are also correct. The anchor is part of the wallpaper of an output: a transition uses it, and `still` reads it from `query`.
 - **Colour:** a 1×1 buffer with the viewport destination at the logical size. It uses almost no memory.
 - **Changes:** on `configure` or a scale event, the daemon builds the Target of that output again and renders it in full. On `global_remove`, it destroys the Target. There is no debounce, because Wayland events come in batches ending in `done` or `configure`.
@@ -178,7 +175,7 @@ The items below describe burn, and the parts that all transitions share.
 - **Order:** the fire starts at a random cell. The cells start to burn in the link order of the simple Prim's algorithm (a random spanning tree), at a rate that burns all cells in approximately 2 s.
 - **Cell:** old wallpaper → 8 fire colours (`FFFFFF` … `510100`, 11 steps in total) → new wallpaper. One burnt cell in 64 emits a smoke cell that rises for 16 steps (`504F4F` … `C7C7C7`).
 - **Step:** 33 ms, on the timerfd. A step has no allocation.
-- **Images:** the old and the new wallpaper are 1× canvases, each with its own integer scale. A colour is a 1 × 1 canvas. An animation plays during the transition: the old one keeps its player until the last step, and the new one starts at frame 0 with the transition. Thus two players can run for the time of a transition. The players only advance their canvases; the steps draw the frames. A player of a transition does not become `hidden`. If one of the two images is not pixel art, there is no transition.
+- **Images:** the old and the new wallpaper are 1× canvases, each with its own integer scale. A colour is a 1 × 1 canvas. An animation plays during the transition: the old one keeps its player until the last step, and the new one starts at frame 0 with the transition. Thus two players can run for the time of a transition. The players only advance their canvases; the steps draw the frames. A player of a transition does not become `hidden`.
 - **Render:** each cell has a display code (old, new, old in grey, new moved by n cells, or a colour) and the step of its last change. A buffer records the step and the frame of each player that it holds. A buffer that holds step j gets the cells that changed after j. For each rect that changed in an image after the frame that the buffer holds, it also gets the cells that show that image there. For slide, a rect of the new image draws again the full width of the moved bands in its rows. The damage is the bounding box of the cells that changed in the step, and one bounding box for each such rect.
 - **Grey:** for sweep, the grey image gets the rects that changed in the old image.
 - **Output:** during the transition, the output has a buffer pool of the physical size. A `configure` or a scale change ends the transition on that output. After the last step, the output builds its normal Target.
@@ -251,19 +248,19 @@ Each phase ends with passing `cargo test` and `cargo clippy`.
    - Wayland globals, outputs and layer surfaces.
    - Colour wallpaper with a 1×1 buffer and viewport.
    - `query`, `kill`, `pause` and `resume`.
-5. **Static images.** Start the child, wait on its pidfd, mmap the cache. Pixel-art Target with a full upscale; aspect-fill Target with the viewport source. Buffer release and munmap when idle.
+5. **Static images.** Start the child, wait on its pidfd, mmap the cache. Pixel-art Target with a full upscale. Buffer release and munmap when idle.
 6. **Animation.** Player canvas, ring, timer. Target dirty sets, per-rect damage, buffer age.
 7. **Pause and output changes.** The frame callback rule; a new Target on scale, size or output change; per-output state file and restore at start.
 8. **Docs.** README and `pixelwp.service`.
 
 ## 15. Verification
 - **Unit tests:**
-  - **pixelart:** solid 48×32 gives 16; a 3× checker gives 3; noise gives 1; `limit` works; the decode restart with a smaller N works.
+  - **pixelart:** solid 48×32 gives 16; a 3× checker gives 3; noise gives 1; `limit` works; the colour limit of art stored at 1× works; the decode restart with a smaller N works.
   - **Integer scale table:** 320×208 on 2560×1664 gives 8, on 2940×1912 gives 10, on 1920×1080 gives 6; 100×100 on 160×160 gives 2; art larger than the screen gives 1.
   - **`upscale_rect`:** a dirty-rect render on top of frame k−1 equals a full render of frame k, bit-exact, for random rects, k from 1 to 13, and odd offsets.
   - **Diff + LZ4 round trip:** every frame is bit-exact, for synthetic frames and fixture GIFs.
   - **Buffer age:** 1, 2 and 3 buffers over 3 loops of 1-, 2- and 3-frame animations give the same pixels as a full render. The same holds when an output skips frames.
-  - **Cache:** bad magic, bad version and a truncated file are rejected. Delay clamp; identical-frame merge. An animation that is not pixel art is rejected.
+  - **Cache:** bad magic, bad version and a truncated file are rejected. Delay clamp; identical-frame merge. An image that is not pixel art is rejected. Art stored at 1× is accepted.
 - **Integration (headless):**
   - Run `sway` with `WLR_BACKENDS=headless` and an output of 3840×2160, plus a second output at scale 1.5.
   - Run `pixelwp daemon` and `pixelwp img fixture-4x.gif`.

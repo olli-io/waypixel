@@ -3,8 +3,10 @@
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::process::{Command, Stdio};
 
 use crate::ipc;
+use crate::pixelart::NOT_PIXEL_ART;
 
 /// Returns the exit code: 0 = ok, 1 = error, 3 = the daemon is not running.
 pub fn request(args: &[&str]) -> i32 {
@@ -40,6 +42,22 @@ pub fn fetch(args: &[&str]) -> Result<String, i32> {
             .strip_prefix("error ")
             .unwrap_or("bad reply from the daemon");
         eprintln!("pixelwp: {text}");
+        if text == NOT_PIXEL_ART {
+            notify(args.get(1).copied().unwrap_or_default(), text);
+        }
         Err(1)
     }
+}
+
+/// Shows a desktop notification with `notify-send`. Does nothing when that
+/// program is not there.
+fn notify(path: &str, text: &str) {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    _ = Command::new("notify-send")
+        .args(["--app-name=pixelwp", "pixelwp"])
+        .arg(format!("{name}: {text}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
