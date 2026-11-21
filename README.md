@@ -1,30 +1,41 @@
 # waypixel
 
-A minimal wallpaper daemon for animated pixel art on wlroots-type Wayland
-compositors (compositors with `zwlr_layer_shell_v1`: Sway, Hyprland, river, niri, ...).
+> [!IMPORTANT]
+> **waypixel is a minimal wallpaper daemon for pixel-perfect pixel art.**
+> It is for wlroots-type Wayland compositors (`zwlr_layer_shell_v1`: Sway, Hyprland, niri).
+> No feature requests and no support. Fork it.
 
-- Pixel art (GIF, APNG, animated WebP, or a still) always gets an integer scale.
-  The image is centred and the overflow is cut.
-- An image is pixel art when it is an integer upscale (2× or more), or when it
-  is small (no side longer than 640 px) and has 256 colours or fewer.
-- Other images are rejected: `waypixel img` prints an error and shows a desktop
-  notification (with `notify-send`, if it is installed).
-- The daemon keeps the art at 1× and draws only the changed areas on each frame.
-- The animation stops when the compositor does not show the wallpaper.
+> [!NOTE]
+> waypixel accepts only true pixel art: an N× integer upscale, or a 1:1 image of
+> no more than 640 px per side and 256 colours. It rejects all other images:
+> `waypixel img` prints an error and the wallpaper does not change.
+> `waypixel check <dir>` lists the images in a folder that it rejects.
+
+Performance features:
+- **Small files.** GIFs are automatically downscaled and cached at 1x size. Only the pixels that change between frames are saved.
+- **Low memory.** A separate process decodes the image and then exits. The daemon keeps only the optimized cache.
+- **Low CPU.** On each frame, only the changed regions of the screen are redrawn.
+- **Fast runtime scale to target resolution.** Pixel art needs no filters, true integer scaling.
 
 The full design is in [SPEC.md](SPEC.md).
 
 ## Install
 
-Requirements: Rust, and `wayland-protocols` (for the build).
-
 ```sh
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/olli-io/waypixel/main/install.sh | sh
 ```
 
-The script builds the release binary, copies it to `~/.cargo/bin` (set `BINDIR`
-for a different directory), and installs, enables and starts the systemd user
-unit. To install only the binary: `cargo install --path .`
+The script downloads the latest released binary (x86_64 or aarch64), copies it
+to `~/.local/bin`, and installs, enables and starts the systemd user unit.
+Set `BINDIR` for a different directory. Set `VERSION=vX.Y.Z` for a specific release.
+
+## Build
+
+Requirements: Rust 1.85 or later, `wayland` and `wayland-protocols`.
+
+```sh
+cargo install --locked --path .    # installs to ~/.cargo/bin
+```
 
 ## Use
 
@@ -36,6 +47,7 @@ waypixel img "$(fzf)"                      # select a file with a shell tool
 waypixel clear --color 202020              # solid colour (default 000000)
 waypixel img forest.gif --fx wipe          # transition for this change only
 waypixel img forest.gif --anchor bottom    # keep the bottom edge in view
+waypixel check ~/wallpapers                # list the images that are not pixel art
 waypixel query                             # <name> <w>x<h> <file|color #RRGGBB> <state> [<anchor>]
 waypixel still ~/lock.png                  # first frame of the largest output, as a PNG
 waypixel still ~/lock.png --output DP-1    # first frame of one output
@@ -52,10 +64,6 @@ of the image that stays in view: `center` (default), `top`, `bottom`, `left`,
 anchor only when it is not `center`.
 
 ## Transitions
-
-A change of wallpaper shows a transition, after the effects of
-[ttfx](https://github.com/omacom/ttfx). A transition runs on a grid of
-540 × 270 cells, which gets an integer scale as pixel art does.
 
 | Name | Effect |
 |---|---|
@@ -104,12 +112,12 @@ background {
 
 ```sh
 mkdir -p ~/.config/systemd/user
-cp waypixel.service ~/.config/systemd/user/
+cp waypixel.service ~/.config/systemd/user/    # edit ExecStart if the binary is not in ~/.local/bin
 systemctl --user daemon-reload
 systemctl --user enable --now waypixel.service
 ```
 
-The unit starts `~/.cargo/bin/waypixel daemon` with `graphical-session.target`.
+The unit starts `~/.local/bin/waypixel daemon` with `graphical-session.target`.
 The compositor must put `WAYLAND_DISPLAY` into the systemd user environment.
 Logs: `journalctl --user -u waypixel`.
 

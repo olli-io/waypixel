@@ -59,6 +59,7 @@ file ─(child: image crate)─▶ pixel-art detect ─▶ 1× frames ─▶ til
 | `waypixel img <path> [--output <name\|all>] [--fx <name>] [--anchor <name>]` | Set the wallpaper. Default `all`. `--fx`: see §9a. `--anchor`: see §8. |
 | `waypixel clear [--color <hex>] [--output ...] [--fx ...]` | Solid colour. Default `000000`. |
 | `waypixel query` | One line per output: `<name> <w>x<h> <file\|color #RRGGBB> <state> [<anchor>]`. The anchor is shown only when it is not `center`. |
+| `waypixel check [<dir>]` | One line for each image of the directory that `img` rejects: `<path>: <reason>`. Default: the current directory. Not recursive. The client does this, without the daemon and without a cache file. Exit code 1 when a line is printed. |
 | `waypixel still <file.png> [--output <name>]` | Write frame 0 of one output as a PNG. Default: the largest output. The client does this: it reads `query` and the cache file. An image has the output size and the integer scale; a colour is 1×1. |
 | `waypixel pause` / `resume` | Manual pause. |
 | `waypixel kill` | Stop the daemon. |
@@ -198,7 +199,7 @@ When no player has a deadline, the timer is disarmed. The current frame stays on
   - A new output uses its own line, or else the `all` line.
 - **Start at login:** the repo contains `waypixel.service`, a systemd user unit. The README tells the user how to copy and enable it. Its settings:
   - `Type=simple`.
-  - `ExecStart=%h/.cargo/bin/waypixel daemon`.
+  - `ExecStart=%h/.local/bin/waypixel daemon`.
   - `Restart=on-failure`.
   - `PartOf=` and `After=graphical-session.target`.
   - `WantedBy=graphical-session.target`.

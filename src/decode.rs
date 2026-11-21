@@ -96,7 +96,8 @@ enum Pass {
 }
 
 struct Encoder<'a> {
-    dst: &'a Path,
+    /// the cache file; `None` = check only, write nothing
+    dst: Option<&'a Path>,
     /// block size; 0 = not known yet
     n: u32,
     size: (u32, u32),
@@ -124,11 +125,18 @@ impl Encoder<'_> {
         if n == 1 && !(w.max(h) <= MAX_1X_SIDE && self.palette.add(&xrgb)) {
             return Err(NOT_PIXEL_ART.into());
         }
+        let Some(dst) = self.dst else {
+            if self.size != (0, 0) && (w, h) != self.size {
+                return Err("frames have different sizes".into());
+            }
+            self.size = (w, h);
+            return Ok(None);
+        };
         let small = if n > 1 { shrink(&xrgb, w, h, n) } else { xrgb };
         let (sw, sh) = (w / n, h / n);
 
         let Some(writer) = &mut self.writer else {
-            let mut writer = Writer::create(self.dst, sw, sh).map_err(e)?;
+            let mut writer = Writer::create(dst, sw, sh).map_err(e)?;
             let full = [Rect::new(0, 0, sw, sh)];
             writer.add_frame(delay_ms, &full, &small).map_err(e)?;
             self.writer = Some(writer);
@@ -152,7 +160,7 @@ impl Encoder<'_> {
     }
 }
 
-fn pass(src: &Path, dst: &Path, n: u32) -> Result<Pass, String> {
+fn pass(src: &Path, dst: Option<&Path>, n: u32) -> Result<Pass, String> {
     let mut enc = Encoder {
         dst,
         n,
@@ -181,15 +189,18 @@ fn pass(src: &Path, dst: &Path, n: u32) -> Result<Pass, String> {
             }
         }
     }
-    let writer = enc.writer.ok_or("image has no frames")?;
-    writer
-        .finish()
-        .map_err(|e| format!("cannot write cache file: {e}"))?;
+    if enc.size == (0, 0) {
+        return Err("image has no frames".into());
+    }
+    if let Some(writer) = enc.writer {
+        writer
+            .finish()
+            .map_err(|e| format!("cannot write cache file: {e}"))?;
+    }
     Ok(Pass::Done)
 }
 
-/// Decodes `src` and writes the cache file `dst`.
-pub fn run(src: &Path, dst: &Path) -> Result<(), String> {
+fn passes(src: &Path, dst: Option<&Path>) -> Result<(), String> {
     let mut n = 0;
     loop {
         match pass(src, dst, n)? {
@@ -197,6 +208,16 @@ pub fn run(src: &Path, dst: &Path) -> Result<(), String> {
             Pass::Restart(smaller) => n = smaller,
         }
     }
+}
+
+/// Decodes `src` and writes the cache file `dst`.
+pub fn run(src: &Path, dst: &Path) -> Result<(), String> {
+    passes(src, Some(dst))
+}
+
+/// Does the checks of `run`, but writes no cache file.
+pub fn check(src: &Path) -> Result<(), String> {
+    passes(src, None)
 }
 
 #[cfg(test)]
@@ -303,6 +324,7 @@ pub mod tests {
         let wpx = temp("restart.wpx");
         write_gif(&gif, &[(f0.clone(), 100), (f1.clone(), 100)], w, h);
         run(&gif, &wpx).unwrap();
+        assert_eq!(check(&gif), Ok(()));
         let cache = Cache::open(&wpx).unwrap();
         assert_eq!((cache.w, cache.h), (w / 2, h / 2));
         assert_eq!(cache.frame_count(), 2);
@@ -337,6 +359,7 @@ pub mod tests {
         write_gif(&gif, &[(f0, 100), (f1, 100)], 20, 10);
         assert_eq!(run(&gif, &wpx).err().unwrap(), NOT_PIXEL_ART);
         assert!(!wpx.exists());
+        assert_eq!(check(&gif).err().unwrap(), NOT_PIXEL_ART);
 
         // too large for art stored at 1×
         let w = MAX_1X_SIDE + 1;
@@ -392,6 +415,8 @@ pub mod tests {
         to_rgba(&v, 31, 17).save(&png).unwrap();
         assert_eq!(run(&png, &wpx).err().unwrap(), NOT_PIXEL_ART);
         assert!(!wpx.exists());
+        assert_eq!(check(&png).err().unwrap(), NOT_PIXEL_ART);
+        assert_eq!(check(&temp("art.png")), Ok(()));
     }
 
     #[test]

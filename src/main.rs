@@ -3,6 +3,7 @@
 //! One binary with three roles: the daemon, the client, and the decode child.
 
 mod cache;
+mod check;
 mod client;
 mod daemon;
 mod decode;
@@ -23,6 +24,8 @@ Usage:
   waypixel clear [--color <hex>] [--output ...] [--fx ...]
                                                  solid colour (default: 000000)
   waypixel query                                  one line for each output
+  waypixel check [<dir>]                          list the images that are not pixel art
+                                                 (default: the current directory)
   waypixel still <file.png> [--output <name>]     write the wallpaper of one output as a PNG
                                                  (default: the largest output)
   waypixel pause | resume                         manual pause
@@ -52,6 +55,9 @@ enum Cmd {
         fx: String,
     },
     Query,
+    Check {
+        dir: String,
+    },
     Still {
         path: String,
         output: Option<String>,
@@ -162,6 +168,11 @@ fn parse(args: &[String]) -> Result<Cmd, String> {
                 output: p.output.unwrap_or_else(|| "all".into()),
             })
         }
+        "check" => match rest {
+            [] => Ok(Cmd::Check { dir: ".".into() }),
+            [dir] => Ok(Cmd::Check { dir: dir.clone() }),
+            _ => Err("check takes one directory".into()),
+        },
         "still" => {
             let p = parse_options(rest, &["--output"])?;
             let [path] = p.positional.as_slice() else {
@@ -246,6 +257,7 @@ fn main() -> ExitCode {
         }
         Cmd::Clear { color, output, fx } => client::request(&["clear", &color, &output, &fx]),
         Cmd::Query => client::request(&["query"]),
+        Cmd::Check { dir } => check::run(dir.as_ref()),
         Cmd::Still { path, output } => still::run(path.as_ref(), output.as_deref()),
         Cmd::Pause => client::request(&["pause"]),
         Cmd::Resume => client::request(&["resume"]),
@@ -311,6 +323,9 @@ mod tests {
                 output: Some("DP-1".into()),
             })
         );
+        assert_eq!(p(&["check"]), Ok(Cmd::Check { dir: ".".into() }));
+        assert_eq!(p(&["check", "art"]), Ok(Cmd::Check { dir: "art".into() }));
+        assert!(p(&["check", "a", "b"]).is_err());
         assert!(p(&["still"]).is_err());
         assert!(p(&[]).is_err());
         assert!(p(&["img"]).is_err());
