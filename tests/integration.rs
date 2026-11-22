@@ -1206,6 +1206,19 @@ fn targets_4k() {
     to_rgba(&art, 320, 180, 4).save(&png).unwrap();
     env.ok(&["img", png.to_str().unwrap()]);
     assert!(env.texture(0).0 == reference(&art, (320, 180), screen));
+    // the daemon writes the lock screen image after the change
+    let lock = env.dir.join("config/.lockscreen.png");
+    let expected = reference(&art, (320, 180), screen);
+    wait("lock screen image", || {
+        image::open(&lock).is_ok_and(|img| {
+            let img = img.to_rgb8();
+            img.dimensions() == (3840, 2160)
+                && img
+                    .pixels()
+                    .zip(&expected)
+                    .all(|(p, e)| u32::from_be_bytes([0, p[0], p[1], p[2]]) == e & 0xFF_FFFF)
+        })
+    });
     wait("still buffer destroyed", || env.mock().live_buffers == 0);
     let (ticks, switches) = (cpu_ticks(env.pid()), ctxt_switches(env.pid()));
     std::thread::sleep(Duration::from_millis(500));
@@ -1330,13 +1343,16 @@ fn burn_transition() {
     assert_eq!(mixed, [true; 2]);
     assert_eq!(live, [false, true, true], "the animation did not play");
     let secs = start.elapsed().as_secs_f64();
-    assert!((2.0..6.0).contains(&secs), "the transition took {secs} s");
+    assert!((1.5..6.0).contains(&secs), "the transition took {secs} s");
     let mut seen = [false; 3];
     wait("all frames after the transition", || {
         seen[shown_frame(&env, 0, &refs[0])] = true;
         seen.iter().all(|s| *s)
     });
 
+    // The transition ends one step after its final pixels. A change before
+    // that is ignored.
+    std::thread::sleep(Duration::from_millis(200));
     // to a colour, on one output: the result is the 1×1 buffer
     env.ok(&[
         "clear", "--color", "405060", "-o", "HDMI-A-1", "--fx", "burn",
@@ -1356,10 +1372,19 @@ fn burn_transition() {
     let args = ["clear", "--color", "112233", "-o", "HDMI-A-1"];
     assert!(env.command().args(args).status().unwrap().success());
     assert_eq!(env.texture(1), (vec![0xFF11_2233], (1, 1)));
-    for fx in ["sweep", "wipe"] {
+    let names = [
+        "sweep", "wipe", "decrypt", "pour", "smoke", "vhstape", "rain",
+    ];
+    for fx in names {
         env.ok(&["clear", "--color", "405060", "-o", "HDMI-A-1", "--fx", fx]);
         assert_eq!(env.texture(1).1, phys[1]);
+        // a change during the transition is ignored
         env.ok(&["clear", "--color", "112233", "-o", "HDMI-A-1"]);
+        wait("colour after the transition", || {
+            env.texture(1) == (vec![0xFF40_5060], (1, 1))
+        });
+        env.ok(&["clear", "--color", "112233", "-o", "HDMI-A-1"]);
+        assert_eq!(env.texture(1), (vec![0xFF11_2233], (1, 1)), "{fx}");
     }
     let (code, _, _) = env.cli(&["clear", "--fx", "melt"]);
     assert_eq!(code, 2);

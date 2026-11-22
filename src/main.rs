@@ -31,8 +31,9 @@ Usage:
   waypixel pause | resume                         manual pause
   waypixel kill                                   stop the daemon
 
---fx is the transition: burn, sweep, slide, wipe or disabled. The default is the
-`transition` key in ~/.config/waypixel/config, or else burn.
+--fx is the transition: burn, sweep, slide, wipe, decrypt, pour,
+smoke, vhstape, rain or disabled. The default is the `transition` key in
+~/.config/waypixel/config, or else burn.
 
 --anchor is the part of the image that stays in view when the scale cuts the
 overflow: center (default), top, bottom, left, right, topleft, topright,
@@ -258,7 +259,11 @@ fn main() -> ExitCode {
         Cmd::Clear { color, output, fx } => client::request(&["clear", &color, &output, &fx]),
         Cmd::Query => client::request(&["query"]),
         Cmd::Check { dir } => check::run(dir.as_ref()),
-        Cmd::Still { path, output } => still::run(path.as_ref(), output.as_deref()),
+        Cmd::Still { path, output } => {
+            // the daemon starts this child for the lock screen image
+            daemon::reset_signals();
+            still::run(path.as_ref(), output.as_deref())
+        }
         Cmd::Pause => client::request(&["pause"]),
         Cmd::Resume => client::request(&["resume"]),
         Cmd::Kill => client::request(&["kill"]),

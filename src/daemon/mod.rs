@@ -261,6 +261,18 @@ struct Job {
     fx: Option<Kind>,
 }
 
+/// The lock screen image: `$XDG_CONFIG_HOME/.lockscreen.png`. A session lock
+/// hides the wallpaper surface, so a lock screen can show this file.
+fn lockscreen_path() -> PathBuf {
+    ipc::xdg_dir("XDG_CONFIG_HOME", ".config").join(".lockscreen.png")
+}
+
+/// A running `waypixel still` child that writes the lock screen image.
+struct StillJob {
+    child: Child,
+    pidfd: OwnedFd,
+}
+
 /// A transition to one wall. All outputs that got the wall with one
 /// request show the same transition.
 struct Transition {
@@ -288,6 +300,10 @@ struct Daemon {
     /// true during the restore at start: no cache cleanup
     restoring: bool,
     jobs: Vec<Job>,
+    /// the child that writes the lock screen image
+    still: Option<StillJob>,
+    /// the wallpaper changed after the start of `still`
+    still_pending: bool,
     clients: Vec<Client>,
     next_client: u64,
     timer: OwnedFd,
@@ -569,6 +585,17 @@ impl Daemon {
         cache::cleanup(&keep);
     }
 
+    /// True while a transition runs on an output that a change to `target`
+    /// affects.
+    fn busy(&self, target: &str) -> bool {
+        self.outputs.iter().any(|o| {
+            o.fx().is_some()
+                && (o.name == target
+                    || target == "all"
+                        && self.state.lookup(&o.name).is_none_or(|e| e.target == "all"))
+        })
+    }
+
     fn check_target(&self, target: &str) -> Result<(), String> {
         let known = target == "all"
             || self.outputs.iter().any(|o| o.name == target)
@@ -673,6 +700,46 @@ impl Daemon {
         }
         self.apply_target(target, fx);
         self.gc();
+        if persist {
+            self.write_lockscreen();
+        }
+    }
+
+    /// Writes the lock screen image again. One child runs at a time: a change
+    /// during its run starts a new child when it exits.
+    fn write_lockscreen(&mut self) {
+        self.still_pending = true;
+        if self.still.is_some() {
+            return;
+        }
+        self.still_pending = false;
+        let spawn = || -> std::io::Result<StillJob> {
+            std::fs::create_dir_all(lockscreen_path().parent().unwrap())?;
+            // the child reads `query` and the cache file, as `waypixel still` does
+            let child = Command::new("/proc/self/exe")
+                .arg("still")
+                .arg(lockscreen_path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .spawn()?;
+            let pid = rustix::process::Pid::from_child(&child);
+            let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())?;
+            Ok(StillJob { child, pidfd })
+        };
+        match spawn() {
+            Ok(job) => self.still = Some(job),
+            Err(e) => eprintln!("waypixel: cannot write the lock screen image: {e}"),
+        }
+    }
+
+    /// Handles the exit of the lock screen child.
+    fn finish_still(&mut self) {
+        if let Some(mut job) = self.still.take() {
+            _ = job.child.wait();
+        }
+        if self.still_pending {
+            self.write_lockscreen();
+        }
     }
 
     /// Handles the exit of a decode child.
@@ -682,7 +749,15 @@ impl Daemon {
         };
         let mut job = self.jobs.swap_remove(index);
         let ok = job.child.wait().is_ok_and(|status| status.success());
-        let result = if ok && Cache::open(&cache::path_for(&job.hash)).is_ok() {
+        let valid = ok && Cache::open(&cache::path_for(&job.hash)).is_ok();
+        // A transition that started during the decode: the change is dropped.
+        if valid && job.persist && self.busy(&job.target) {
+            if let Some(id) = job.client {
+                self.reply(id, Ok(String::new()));
+            }
+            return;
+        }
+        let result = if valid {
             self.apply_image(
                 &job.target,
                 &job.path,
@@ -778,10 +853,14 @@ impl Daemon {
                 if let Err(e) = self.check_target(target) {
                     return Some(Err(e));
                 }
+                if self.busy(target) {
+                    return ok();
+                }
                 self.state.set(target, Spec::Color(color));
                 self.state.save();
                 self.apply_target(target, fx);
                 self.gc();
+                self.write_lockscreen();
                 ok()
             }
             ["img", path, target, fx, anchor] => {
@@ -797,6 +876,9 @@ impl Daemon {
                 }
                 if let Err(e) = self.check_target(target) {
                     return Some(Err(e));
+                }
+                if self.busy(target) {
+                    return ok();
                 }
                 match self.start_img(path, anchor, target, Some(client), true, fx) {
                     Ok(true) => ok(),
@@ -1240,6 +1322,8 @@ fn run_inner() -> Result<i32, String> {
         state: State::load(),
         restoring: true,
         jobs: Vec::new(),
+        still: None,
+        still_pending: false,
         clients: Vec::new(),
         next_client: 1,
         timer,
@@ -1267,7 +1351,7 @@ fn run_inner() -> Result<i32, String> {
     daemon.restoring = false;
     daemon.gc();
 
-    let mut fds: Vec<PollFd<'static>> = Vec::with_capacity(4 + MAX_CLIENTS + MAX_JOBS);
+    let mut fds: Vec<PollFd<'static>> = Vec::with_capacity(5 + MAX_CLIENTS + MAX_JOBS);
     let mut ready_clients: Vec<u64> = Vec::with_capacity(MAX_CLIENTS);
     let mut ready_jobs: Vec<u32> = Vec::with_capacity(MAX_JOBS);
     // SAFETY: `fds` is cleared and filled again before each poll, so no entry is
@@ -1319,6 +1403,12 @@ fn run_inner() -> Result<i32, String> {
                 PollFlags::IN,
             ));
         }
+        if let Some(s) = &daemon.still {
+            fds.push(PollFd::from_borrowed_fd(
+                borrow(s.pidfd.as_fd()),
+                PollFlags::IN,
+            ));
+        }
         match poll(&mut fds, None) {
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => continue,
@@ -1351,12 +1441,17 @@ fn run_inner() -> Result<i32, String> {
                 .filter(|(_, fd)| hit(fd))
                 .map(|(j, _)| j.child.id()),
         );
+        let still_hit = daemon.still.is_some() && hit(&fds[4 + n + daemon.jobs.len()]);
 
         if signal_hit {
             break 0;
         }
         if timer_hit {
             daemon.armed = None;
+        }
+        // before the requests: a request can start a new child
+        if still_hit {
+            daemon.finish_still();
         }
         if wayland_hit {
             let mut msgs = match receiver.recv(daemon.wl.fd()) {
@@ -1418,6 +1513,13 @@ fn run_inner() -> Result<i32, String> {
     for job in &mut daemon.jobs {
         _ = job.child.kill();
         _ = job.child.wait();
+    }
+    // the daemon does not answer the `query` of the child now
+    if let Some(mut job) = daemon.still.take() {
+        _ = job.child.kill();
+        _ = job.child.wait();
+        let tmp = lockscreen_path().with_extension(format!("tmp{}", job.child.id()));
+        _ = std::fs::remove_file(tmp);
     }
     _ = std::fs::remove_file(&socket_path);
     Ok(code)

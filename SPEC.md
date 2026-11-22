@@ -165,10 +165,15 @@ The fill is fast, so the dirty rects do not save much daemon CPU. Their purpose 
 ## 9a. Transitions
 `img` and `clear` show the change with a transition. The transitions are effects of ttfx, changed from terminal symbols to pixel-art cells. A restore at daemon start has no transition.
 
-- **Selection:** `--fx <burn|sweep|slide|wipe|disabled>`. Without `--fx`, the daemon reads the key `transition = <name>` from `$XDG_CONFIG_HOME/waypixel/config` at each request. The default is `burn`. A bad value gives a log line and `burn`. Lines without `=` and text after `#` are ignored.
+- **Selection:** `--fx <burn|sweep|slide|wipe|decrypt|pour|smoke|vhstape|rain|disabled>`. Without `--fx`, the daemon reads the key `transition = <name>` from `$XDG_CONFIG_HOME/waypixel/config` at each request. The default is `burn`. A bad value gives a log line and `burn`. Lines without `=` and text after `#` are ignored.
 - **Sweep:** a shimmer of random greys goes from right to left in 40 steps (`in_out_quad`) and leaves the old wallpaper in grey. Then a shimmer of random colours (`8A008A` … `FFFFFF`) goes from left to right and leaves the new wallpaper. A cell shimmers for 4 steps.
-- **Slide:** bands of 6 rows. Band b starts at step b + 1 and moves for 24 steps (`in_out_quad`): the new wallpaper comes in from the left.
+- **Slide:** bands of 6 rows. Band b starts at step ⌊3b / 4⌋ + 1 and moves for 24 steps (`in_out_quad`): the new wallpaper comes in from the left.
 - **Wipe:** the diagonals start from the top left to the bottom right in 50 steps (`in_out_quad`). A cell shows the colours `833AB4` … `FCB045` for 4 steps, then the new wallpaper.
+- **Decrypt:** a symbol is 4 × 6 cells: a glyph of 3 × 5 cells on black, with a gap of 1 cell at the right and at the bottom. The symbols start in the order of their depth in a random spanning tree of the symbol grid, as in smoke, at the same rate, in 30 steps. A new symbol shows a random glyph in white for 3 steps, then in one of the greens `008000`, `00CB00`, `00FF00`. A green symbol gets a new glyph and green with a probability of 1/4 for each step. The end steps come from a second such order from a different random symbol: from step 16, at the same rate, in 40 steps. A symbol ends 14 steps after its start at the earliest. Before its end step the glyph of a symbol is white for 3 steps. Then the symbol shows the new wallpaper.
+- **Pour:** tiles of 15 × 15 cells, from the bottom row up. Each row has the opposite direction to the row below. 7 tiles start in each step. A tile falls from above the top row for 10 to 15 steps (`in_quad`). It shows the new wallpaper of its position, moved up. At its position it shows the new wallpaper.
+- **Smoke:** a random spanning tree grows from a random cell, each time to the adjacent cell with the lowest random weight. The cells start in the order of their depth in the tree, at a rate that starts all cells in 60 steps. A cell shows 8 colours (`242424`, `FFFFFF`, `00D1FF`, `8A008A`) for 16 steps, then the new wallpaper.
+- **Vhstape:** lines of 6 rows. For 50 steps: a wave of 3 lines (moved 24, 42 and 24 cells to the left) goes down in most steps, and starts again in the top half when it gets to the bottom. With a probability of 1/6 for each step, a random line jumps 12 to 60 cells to the left for 8 to 25 steps (3 lines at most). A moved line shows the old wallpaper in grey, and black at its end. While it moves (10 cells for each step), it shows only the red, green or blue channel. With a probability of 1/30 for each step, noise (6 greys, runs of 1 to 4 cells, new each 2 steps) covers all lines for 6 steps. Then all lines go back, noise covers all lines for 14 steps. Then each line gets a random end step in a range of 24 steps. Before its end step a line is white for 3 steps. Then the line shows the new wallpaper. The other lines continue to show noise.
+- **Rain:** tiles of 6 × 6 cells, from the bottom row up, in a random order across 3 rows. 68 drops start in each step. A drop is one column of 1 to 5 cells. It shows the new wallpaper of its tile, moved up. It falls from the top to its tile for 10 to 17 steps (`in_quart`). Then the tile shows the new wallpaper.
 
 The items below describe burn, and the parts that all transitions share.
 
@@ -177,10 +182,11 @@ The items below describe burn, and the parts that all transitions share.
 - **Cell:** old wallpaper → 8 fire colours (`FFFFFF` … `510100`, 11 steps in total) → new wallpaper. One burnt cell in 64 emits a smoke cell that rises for 16 steps (`504F4F` … `C7C7C7`).
 - **Step:** 33 ms, on the timerfd. A step has no allocation.
 - **Images:** the old and the new wallpaper are 1× canvases, each with its own integer scale. A colour is a 1 × 1 canvas. An animation plays during the transition: the old one keeps its player until the last step, and the new one starts at frame 0 with the transition. Thus two players can run for the time of a transition. The players only advance their canvases; the steps draw the frames. A player of a transition does not become `hidden`.
-- **Render:** each cell has a display code (old, new, old in grey, new moved by n cells, or a colour) and the step of its last change. A buffer records the step and the frame of each player that it holds. A buffer that holds step j gets the cells that changed after j. For each rect that changed in an image after the frame that the buffer holds, it also gets the cells that show that image there. For slide, a rect of the new image draws again the full width of the moved bands in its rows. The damage is the bounding box of the cells that changed in the step, and one bounding box for each such rect.
-- **Grey:** for sweep, the grey image gets the rects that changed in the old image.
+- **Render:** each cell has a display code (old, new, old in grey, new moved by n cells, old in grey moved by n cells with a tint, or a colour) and the step of its last change. A buffer records the step and the frame of each player that it holds. A buffer that holds step j gets the cells that changed after j. For each rect that changed in an image after the frame that the buffer holds, it also gets the cells that show that image there. For slide, a rect of the new image draws again the full width of the moved bands in its rows. For vhstape, a rect of the old image does the same for the moved lines. The damage is the bounding box of the cells that changed in the step, and one bounding box for each such rect.
+- **Grey:** for sweep and vhstape, the grey image gets the rects that changed in the old image.
 - **Output:** during the transition, the output has a buffer pool of the physical size. A `configure` or a scale change ends the transition on that output. After the last step, the output builds its normal Target.
 - Manual pause does not stop a transition. An output that is not ready skips steps.
+- **Block:** the daemon does not switch wallpapers during a transition. The daemon ignores an `img` or `clear` for a target with an output in a transition, and an `img` whose decode ends during such a transition. The reply is `ok`. The state does not change. A restore is not ignored.
 
 ## 10. Pause rules
 There is no pause timer. Two rules apply:
@@ -194,6 +200,7 @@ There is no pause timer. Two rules apply:
 When no player has a deadline, the timer is disarmed. The current frame stays on screen. The buffers stay valid, so no full render is necessary on resume.
 
 ## 11. State and start at login
+- **Lock screen image:** after each `img` or `clear` that changes the state, the daemon starts `waypixel still $XDG_CONFIG_HOME/.lockscreen.png` as a child. One child runs at a time. A change during its run starts a new child when it exits. A restore at start does not write the file.
 - **State:** `$XDG_STATE_HOME/waypixel/state`, one line per target: `<name|all> img <anchor> <path>` or `<name|all> color <hex>`. A line without an anchor (the path starts with `/`) has the anchor `center`.
   - It is written with a temp file + rename on each change, and read at daemon start.
   - A new output uses its own line, or else the `all` line.
@@ -223,7 +230,7 @@ When no player has a deadline, the timer is disarmed. The current frame stays on
   src/diff.rs        tile diff, rect merge
   src/cache.rs       .wpx writer/reader, validation, cleanup
   src/scale.rs       upscale_rect (u32 fill)
-  src/fx.rs          transitions: cell grid, burn, sweep, slide, wipe, render
+  src/fx.rs          transitions: cell grid, the 10 effects, render
   src/daemon/mod.rs      poll loop, IPC server, state file, signals
   src/daemon/wayland.rs  generated protocol include (from pixelawww)
   src/daemon/output.rs   surfaces, viewport, scale, Target

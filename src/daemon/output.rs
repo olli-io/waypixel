@@ -47,7 +47,7 @@ struct Fx {
     old: Canvas,
     /// the player of the old wallpaper, which has the current pixels of `old`
     old_player: Option<u32>,
-    /// the old wallpaper in grey, for sweep
+    /// the old wallpaper in grey, for sweep and vhstape
     grey: Box<[u32]>,
     /// the frame of the old player that `grey` shows
     grey_seq: u64,
@@ -418,7 +418,7 @@ impl Output {
             held,
             last_committed: now,
         };
-        if effect.kind == Kind::Sweep {
+        if matches!(effect.kind, Kind::Sweep | Kind::Vhstape) {
             // `old` is the current frame of its player
             fx.grey = fx.old.grey();
         }

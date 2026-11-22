@@ -1,18 +1,22 @@
 //! Transitions between two wallpapers, on a grid of pixel-art cells.
 //!
-//! These are effects of ttfx, changed from terminal symbols to cells:
-//! - burn: a fire starts at a random cell and spreads in the order of a random
-//!   spanning tree (the simple Prim's algorithm). Some cells emit smoke.
-//! - sweep: a shimmer of greys goes from right to left and leaves the old
-//!   wallpaper grey. Then a shimmer of colours goes from left to right and
-//!   leaves the new wallpaper.
-//! - slide: the new wallpaper comes in from the left, in bands of rows, one
-//!   band after the other.
-//! - wipe: a diagonal band of colours goes from the top left to the bottom
-//!   right and leaves the new wallpaper.
+//! These are effects of ttfx, changed from terminal symbols to cells. Each
+//! effect has its own module. This module has the parts that they share.
 //!
 //! The grid has no Wayland code. Each output maps it to its screen with an
 //! integer scale, as for an animation.
+
+mod burn;
+mod decrypt;
+mod fall;
+mod slide;
+mod smoke;
+mod sweep;
+mod vhstape;
+mod wipe;
+
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 
 use crate::diff::Rect;
 use crate::scale::{Anchor, Geom, upscale_screen};
@@ -23,45 +27,8 @@ pub const GRID_H: usize = 270;
 /// Time of one step.
 pub const STEP_NS: u64 = 33_000_000;
 
-// ---- burn
-/// Approximate number of steps until all cells have started to burn.
-const IGNITE_STEPS: usize = 60;
-/// Number of steps for which a cell burns. This sets the width of the fire.
-const FIRE_STEPS: u8 = 11;
-const FIRE: [u32; 8] = gradient([0xFFFFFF, 0xFFF75D, 0xFE650D, 0x8A003C, 0x510100]);
-const SMOKE: [u32; 8] = gradient([0x504F4F, 0x6E6D6D, 0x8C8B8B, 0xA9A9A9, 0xC7C7C7]);
-/// Number of steps for which smoke rises, one cell for each step.
-const SMOKE_STEPS: usize = 16;
-const SMOKE_MAX: usize = 2000;
-/// A cell that stops burning emits smoke with a probability of 1 / this.
-const SMOKE_ONE_IN: u32 = 64;
-
-// ---- sweep
-/// Number of steps of one sweep across the grid.
-const SWEEP_STEPS: u32 = 40;
-/// Number of steps for which a cell shimmers. The colour changes each 2 steps.
-const SHIMMER_STEPS: u8 = 4;
-const GREYS: [u32; 5] = [
-    0xFFA0_A0A0,
-    0xFF80_8080,
-    0xFF40_4040,
-    0xFF20_2020,
-    0xFF10_1010,
-];
-const SWEEP: [u32; 8] = gradient([0x8A008A, 0x4569C5, 0x00D1FF, 0x80E8FF, 0xFFFFFF]);
-
-// ---- slide
-/// Rows of cells in one band.
-const BAND_H: usize = 6;
-/// Number of steps for which one band moves.
-const SLIDE_STEPS: u32 = 24;
-
-// ---- wipe
-/// Number of steps of the wipe across the grid.
-const WIPE_STEPS: u32 = 50;
-/// Number of steps for which a cell shows the colours of the wipe.
-const WIPE_CELL_STEPS: u8 = 4;
-const WIPE: [u32; 8] = gradient([0x833AB4, 0xC02C69, 0xFD1D1D, 0xFC6731, 0xFCB045]);
+const BLACK: u32 = 0xFF00_0000;
+const WHITE: u32 = 0xFFFF_FFFF;
 
 /// Display codes. A code with the top byte 0xFF is an XRGB colour.
 const OLD: u32 = 0;
@@ -70,6 +37,12 @@ const NEW: u32 = 1;
 const GREY: u32 = 2;
 /// `SHIFTED | n`: the new wallpaper, moved n cells to the left
 const SHIFTED: u32 = 0x0100_0000;
+/// `GLITCH | tint << 16 | n`: the old wallpaper in grey, moved n cells to the
+/// left. The tints 1, 2 and 3 keep only the red, green or blue channel.
+const GLITCH: u32 = 0x0200_0000;
+/// `LIFTED | n`: the new wallpaper, moved n cells up
+const LIFTED: u32 = 0x0300_0000;
+const TINTS: [u32; 4] = [0xFFFF_FFFF, 0xFFFF_0000, 0xFF00_FF00, 0xFF00_00FF];
 
 /// Cell stages: 0 = no change, 1..=steps = shows colours, DONE = complete.
 const DONE: u8 = u8::MAX;
@@ -81,18 +54,22 @@ const fn gradient(stops: [u32; 5]) -> [u32; 8] {
     while i < 8 {
         // position in 1/7 of the range, which has 4 segments
         let (seg, t) = (i * 4 / 7, (i * 4 % 7) as u32);
-        let (a, b) = (stops[seg], stops[if seg < 4 { seg + 1 } else { 4 }]);
-        let mut c = 0xFF00_0000;
-        let mut shift = 0;
-        while shift < 24 {
-            let (ca, cb) = ((a >> shift) & 0xFF, (b >> shift) & 0xFF);
-            c |= ((ca * (7 - t) + cb * t) / 7) << shift;
-            shift += 8;
-        }
-        out[i] = c;
+        out[i] = mix(stops[seg], stops[if seg < 4 { seg + 1 } else { 4 }], t, 7);
         i += 1;
     }
     out
+}
+
+/// The colour at t / n of the range from `a` to `b`.
+const fn mix(a: u32, b: u32, t: u32, n: u32) -> u32 {
+    let mut c = 0xFF00_0000;
+    let mut shift = 0;
+    while shift < 24 {
+        let (ca, cb) = ((a >> shift) & 0xFF, (b >> shift) & 0xFF);
+        c |= ((ca * (n - t) + cb * t) / n) << shift;
+        shift += 8;
+    }
+    c
 }
 
 fn in_out_quad(t: f64) -> f64 {
@@ -110,10 +87,16 @@ pub enum Kind {
     Sweep,
     Slide,
     Wipe,
+    Decrypt,
+    Pour,
+    Smoke,
+    Vhstape,
+    Rain,
 }
 
 impl Kind {
-    pub const NAMES: &str = "burn, sweep, slide, wipe or disabled";
+    pub const NAMES: &str =
+        "burn, sweep, slide, wipe, decrypt, pour, smoke, vhstape, rain or disabled";
 
     /// Parses the name of a transition. `disabled` gives `Some(None)`.
     pub fn parse(name: &str) -> Option<Option<Self>> {
@@ -122,6 +105,11 @@ impl Kind {
             "sweep" => Self::Sweep,
             "slide" => Self::Slide,
             "wipe" => Self::Wipe,
+            "decrypt" => Self::Decrypt,
+            "pour" => Self::Pour,
+            "smoke" => Self::Smoke,
+            "vhstape" => Self::Vhstape,
+            "rain" => Self::Rain,
             "disabled" => return Some(None),
             _ => return None,
         }))
@@ -186,7 +174,7 @@ pub type Area = (usize, usize, usize, usize);
 pub struct Layers<'a> {
     pub old: (&'a [u32], &'a Geom),
     pub new: (&'a [u32], &'a Geom),
-    /// the old image in grey; only sweep uses it
+    /// the old image in grey; only sweep and vhstape use it
     pub grey: &'a [u32],
 }
 
@@ -200,12 +188,6 @@ impl Rng {
             .wrapping_add(1442695040888963407);
         (((self.0 >> 32) * n as u64) >> 32) as u32
     }
-}
-
-struct Smoke {
-    x: i16,
-    y: i16,
-    age: u16,
 }
 
 pub struct Effect {
@@ -222,59 +204,81 @@ pub struct Effect {
     pub step: u32,
     /// bounds of the cells that changed in this step: (x0, y0, x1, y1)
     bbox: Option<(u16, u16, u16, u16)>,
-    /// burn: the cells in the order in which they start to burn
+    /// burn, smoke: the cells in the order in which they start.
+    /// rain, pour: the tiles in the order in which their drops start.
+    /// decrypt: the symbols in the order in which they start, then the end
+    /// step of each symbol.
     order: Vec<u32>,
+    /// count of the items of `order` that have started.
+    /// vhstape: the top line of the wave.
     head: usize,
-    smoke: Vec<Smoke>,
-    /// sweep, wipe: count of columns or diagonals that have started
+    smoke: Vec<burn::Smoke>,
+    drops: Vec<fall::Drop>,
+    lines: Vec<vhstape::Line>,
+    /// sweep, wipe: count of columns or diagonals that have started.
+    /// decrypt: count of symbols with the new wallpaper.
+    /// vhstape: count of lines with the new wallpaper.
     groups: usize,
-    /// sweep, wipe, slide: count of steps in this phase
+    /// sweep, wipe, slide: count of steps in this phase.
+    /// vhstape: count of steps of noise that remain.
     t: u32,
-    /// sweep: the second sweep runs
+    /// sweep: the second sweep runs.
+    /// vhstape: the noise before the end has started.
     second: bool,
 }
 
-/// The order in which the simple Prim's algorithm links the cells.
-fn prims_order(rng: &mut Rng) -> Vec<u32> {
-    let n = GRID_W * GRID_H;
-    let mut linked = vec![false; n];
-    let unlinked = |linked: &[bool], cell: u32, out: &mut [u32; 4]| {
-        let (x, y) = (cell as usize % GRID_W, cell as usize / GRID_W);
-        let mut count = 0;
-        let mut add = |ok: bool, c: usize| {
-            if ok && !linked[c] {
-                out[count] = c as u32;
-                count += 1;
-            }
-        };
+/// The cells in the order of their depth in a random spanning tree. The tree
+/// grows from a random cell, each time to the adjacent cell with the lowest
+/// random weight (Prim's algorithm with weights on the cells).
+fn flood_order(rng: &mut Rng, (w, h): (usize, usize)) -> Vec<u32> {
+    let n = w * h;
+    let weight: Vec<u32> = (0..n).map(|_| rng.below(1 << 30)).collect();
+    let mut depth = vec![u32::MAX; n];
+    // (weight, cell, depth)
+    let mut heap = BinaryHeap::with_capacity(n);
+    heap.push(Reverse((0, rng.below(n as u32), 0)));
+    while let Some(Reverse((_, cell, d))) = heap.pop() {
         let c = cell as usize;
-        add(y > 0, c.wrapping_sub(GRID_W));
-        add(x + 1 < GRID_W, c + 1);
-        add(y + 1 < GRID_H, c + GRID_W);
-        add(x > 0, c.wrapping_sub(1));
-        count
-    };
-    let start = rng.below(n as u32);
-    let mut order = Vec::with_capacity(n);
-    order.push(start);
-    let mut edges = vec![start];
-    let mut near = [0; 4];
-    while !edges.is_empty() {
-        // The edge list has no order, so `swap_remove` is sufficient.
-        let current = edges.swap_remove(rng.below(edges.len() as u32) as usize);
-        let count = unlinked(&linked, current, &mut near);
-        if count == 0 {
+        if depth[c] != u32::MAX {
             continue;
         }
-        let next = near[rng.below(count as u32) as usize];
-        linked[current as usize] = true;
-        linked[next as usize] = true;
-        order.push(next);
-        if count > 1 {
-            edges.push(current);
+        depth[c] = d;
+        let (x, y) = (c % w, c / w);
+        let mut add = |ok: bool, to: usize| {
+            if ok && depth[to] == u32::MAX {
+                heap.push(Reverse((weight[to], to as u32, d + 1)));
+            }
+        };
+        add(y > 0, c.wrapping_sub(w));
+        add(x + 1 < w, c + 1);
+        add(y + 1 < h, c + w);
+        add(x > 0, c.wrapping_sub(1));
+    }
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.sort_unstable_by_key(|c| depth[*c as usize]);
+    order
+}
+
+/// The tiles of side `tile`, from the bottom row up. With `zigzag`, each row
+/// has the opposite direction to the row below. Without it, each tile changes
+/// position with a random tile of the subsequent `fall::RAIN_ROWS` rows.
+fn tile_order(rng: &mut Rng, tile: usize, zigzag: bool) -> Vec<u32> {
+    let (cols, rows) = (GRID_W / tile, GRID_H / tile);
+    let mut order = Vec::with_capacity(cols * rows);
+    for (i, ty) in (0..rows).rev().enumerate() {
+        for tx in 0..cols {
+            let tx = if zigzag && i % 2 == 1 {
+                cols - 1 - tx
+            } else {
+                tx
+            };
+            order.push((ty * cols + tx) as u32);
         }
-        if unlinked(&linked, next, &mut near) > 0 {
-            edges.push(next);
+    }
+    if !zigzag {
+        for i in 0..order.len() {
+            let span = (fall::RAIN_ROWS * cols).min(order.len() - i);
+            order.swap(i, i + rng.below(span as u32) as usize);
         }
     }
     order
@@ -285,24 +289,41 @@ impl Effect {
         let mut rng = Rng(seed);
         let n = GRID_W * GRID_H;
         let burn = kind == Kind::Burn;
+        let order = match kind {
+            Kind::Burn => burn::prims_order(&mut rng),
+            Kind::Smoke => flood_order(&mut rng, (GRID_W, GRID_H)),
+            Kind::Rain => tile_order(&mut rng, fall::RAIN_TILE, false),
+            Kind::Pour => tile_order(&mut rng, fall::POUR_TILE, true),
+            Kind::Decrypt => decrypt::order(&mut rng),
+            _ => Vec::new(),
+        };
+        let staged = !matches!(
+            kind,
+            Kind::Slide | Kind::Decrypt | Kind::Pour | Kind::Vhstape | Kind::Rain
+        );
         Self {
             kind,
-            order: if burn {
-                prims_order(&mut rng)
-            } else {
-                Vec::new()
+            groups: 0,
+            // each tile has one drop at most
+            drops: Vec::with_capacity(match kind {
+                Kind::Rain | Kind::Pour => order.len(),
+                _ => 0,
+            }),
+            lines: match kind {
+                Kind::Vhstape => vec![vhstape::Line::default(); GRID_H / vhstape::LINE_H],
+                _ => Vec::new(),
             },
+            order,
             rng,
             head: 0,
             stage: vec![0; n].into(),
             // each cell is in the list one time at most
-            active: Vec::with_capacity(if kind == Kind::Slide { 0 } else { n }),
-            smoke: Vec::with_capacity(if burn { SMOKE_MAX } else { 0 }),
+            active: Vec::with_capacity(if staged { n } else { 0 }),
+            smoke: Vec::with_capacity(if burn { burn::SMOKE_MAX } else { 0 }),
             disp: vec![OLD; n].into(),
             stamp: vec![0; n].into(),
             step: 0,
             bbox: None,
-            groups: 0,
             t: 0,
             second: false,
         }
@@ -322,11 +343,12 @@ impl Effect {
     /// (number of steps for which a cell shows colours, what it shows then)
     fn cell_plan(&self) -> (u8, u32) {
         match self.kind {
-            Kind::Burn => (FIRE_STEPS, NEW),
-            Kind::Wipe => (WIPE_CELL_STEPS, NEW),
-            Kind::Sweep if self.second => (SHIMMER_STEPS, NEW),
-            Kind::Sweep => (SHIMMER_STEPS, GREY),
-            Kind::Slide => (0, NEW),
+            Kind::Burn => (burn::FIRE_STEPS, NEW),
+            Kind::Wipe => (wipe::WIPE_CELL_STEPS, NEW),
+            Kind::Sweep if self.second => (sweep::SHIMMER_STEPS, NEW),
+            Kind::Sweep => (sweep::SHIMMER_STEPS, GREY),
+            Kind::Smoke => (smoke::FLOOD_CELL_STEPS, NEW),
+            _ => (0, NEW),
         }
     }
 
@@ -342,12 +364,13 @@ impl Effect {
         }
         let i = (s - 1) as usize;
         match self.kind {
-            Kind::Burn => FIRE[i * FIRE.len() / steps as usize],
-            Kind::Wipe => WIPE[i * WIPE.len() / steps as usize],
+            Kind::Burn => burn::FIRE[i * burn::FIRE.len() / steps as usize],
+            Kind::Wipe => wipe::WIPE[i * wipe::WIPE.len() / steps as usize],
+            Kind::Smoke => smoke::FLOOD[i * smoke::FLOOD.len() / steps as usize],
             // a random colour, which stays for 2 steps
             _ if i % 2 == 1 => self.disp[cell],
-            _ if self.second => SWEEP[self.rng.below(SWEEP.len() as u32) as usize],
-            _ => GREYS[self.rng.below(GREYS.len() as u32) as usize],
+            _ if self.second => sweep::SWEEP[self.rng.below(sweep::SWEEP.len() as u32) as usize],
+            _ => sweep::GREYS[self.rng.below(sweep::GREYS.len() as u32) as usize],
         }
     }
 
@@ -374,15 +397,8 @@ impl Effect {
             self.stage[cell] = DONE;
             self.active.swap_remove(i);
             self.set(cell, end);
-            if self.kind == Kind::Burn
-                && self.smoke.len() < SMOKE_MAX
-                && self.rng.below(SMOKE_ONE_IN) == 0
-            {
-                self.smoke.push(Smoke {
-                    x: (cell % GRID_W) as i16,
-                    y: (cell / GRID_W) as i16,
-                    age: 0,
-                });
+            if self.kind == Kind::Burn {
+                self.emit_smoke(cell);
             }
         }
     }
@@ -406,7 +422,13 @@ impl Effect {
             Kind::Burn => self.head == self.order.len() && idle && self.smoke.is_empty(),
             Kind::Sweep => self.second && self.groups == GRID_W && idle,
             Kind::Wipe => self.groups == GRID_W + GRID_H - 1 && idle,
-            Kind::Slide => self.t >= GRID_H.div_ceil(BAND_H) as u32 - 1 + SLIDE_STEPS,
+            Kind::Slide => self.t >= slide::last_step(),
+            Kind::Decrypt => self.groups == decrypt::SYMS,
+            Kind::Smoke => self.head == self.order.len() && idle,
+            Kind::Rain | Kind::Pour => {
+                self.head == self.order.len() && idle && self.drops.is_empty()
+            }
+            Kind::Vhstape => self.groups == self.lines.len(),
         };
         if done {
             return false;
@@ -418,96 +440,12 @@ impl Effect {
             Kind::Sweep => self.sweep(),
             Kind::Wipe => self.wipe(),
             Kind::Slide => self.slide(),
+            Kind::Decrypt => self.decrypt(),
+            Kind::Smoke => self.smoke(),
+            Kind::Rain | Kind::Pour => self.fall(),
+            Kind::Vhstape => self.vhstape(),
         }
         true
-    }
-
-    fn burn(&mut self) {
-        // remove the smoke from the cells
-        for i in 0..self.smoke.len() {
-            let cell = self.smoke[i].y as usize * GRID_W + self.smoke[i].x as usize;
-            let code = self.base(cell);
-            self.set(cell, code);
-        }
-        self.run_active();
-
-        // new cells start to burn
-        let rate = self.order.len().div_ceil(IGNITE_STEPS) * (2 + self.rng.below(3) as usize) / 3;
-        for _ in 0..rate.min(self.order.len() - self.head) {
-            let cell = self.order[self.head] as usize;
-            self.head += 1;
-            self.start(cell);
-        }
-
-        // the smoke rises
-        let mut i = 0;
-        while i < self.smoke.len() {
-            let s = &mut self.smoke[i];
-            s.age += 1;
-            s.y -= 1;
-            s.x += self.rng.below(3) as i16 - 1;
-            let age = s.age as usize * SMOKE.len() / SMOKE_STEPS;
-            if age >= SMOKE.len() || s.y < 0 || s.x < 0 || s.x >= GRID_W as i16 {
-                self.smoke.swap_remove(i);
-                continue;
-            }
-            let cell = s.y as usize * GRID_W + s.x as usize;
-            self.set(cell, SMOKE[age]);
-            i += 1;
-        }
-    }
-
-    fn sweep(&mut self) {
-        self.run_active();
-        if !self.second && self.groups == GRID_W {
-            // The second sweep starts when the shimmer of the first one has stopped.
-            if self.active.is_empty() {
-                (self.second, self.groups, self.t) = (true, 0, 0);
-            }
-            return;
-        }
-        for group in self.eased_groups(GRID_W, SWEEP_STEPS) {
-            // first from right to left, then from left to right
-            let x = if self.second {
-                group
-            } else {
-                GRID_W - 1 - group
-            };
-            for y in 0..GRID_H {
-                self.start(y * GRID_W + x);
-            }
-        }
-    }
-
-    fn wipe(&mut self) {
-        self.run_active();
-        for d in self.eased_groups(GRID_W + GRID_H - 1, WIPE_STEPS) {
-            // the diagonal x + y = d
-            for x in d.saturating_sub(GRID_H - 1)..=d.min(GRID_W - 1) {
-                self.start((d - x) * GRID_W + x);
-            }
-        }
-    }
-
-    fn slide(&mut self) {
-        self.t += 1;
-        // band b starts to move at step b + 1
-        let first = self.t.saturating_sub(SLIDE_STEPS) as usize;
-        let last = (self.t as usize).min(GRID_H.div_ceil(BAND_H));
-        for band in first..last {
-            let local = self.t - band as u32;
-            // the number of columns that the band covers
-            let edge = (in_out_quad(local as f64 / SLIDE_STEPS as f64) * GRID_W as f64) as usize;
-            let code = match local == SLIDE_STEPS {
-                true => NEW,
-                false => SHIFTED | (GRID_W - edge) as u32,
-            };
-            for y in band * BAND_H..((band + 1) * BAND_H).min(GRID_H) {
-                for x in 0..edge.min(GRID_W) {
-                    self.set(y * GRID_W + x, code);
-                }
-            }
-        }
     }
 
     /// The cells that changed in the last step.
@@ -578,11 +516,19 @@ impl Effect {
             false => code == OLD || code == GREY,
         };
         self.runs(g, area, |cell| shows(self.disp[cell]), &mut f);
-        if new && self.kind == Kind::Slide {
+        if matches!(self.kind, Kind::Slide | Kind::Vhstape) {
             // A moved band shows the rect at a different x. The full width
             // of the band rows is drawn again.
             let strip = (0, area.1, g.sw, area.3);
-            let moved = |cell: usize| self.disp[cell] >> 24 == SHIFTED >> 24;
+            let tag = if new { SHIFTED } else { GLITCH } >> 24;
+            let moved = |cell: usize| self.disp[cell] >> 24 == tag;
+            self.runs(g, strip, moved, &mut f);
+        }
+        if new && matches!(self.kind, Kind::Rain | Kind::Pour) {
+            // A drop shows the rect at a smaller y. The columns above the
+            // rect are drawn again.
+            let strip = (area.0, 0, area.2, area.3);
+            let moved = |cell: usize| self.disp[cell] >> 24 == LIFTED >> 24;
             self.runs(g, strip, moved, &mut f);
         }
     }
@@ -621,6 +567,32 @@ fn draw(dst: &mut [u32], g: &Geom, layers: &Layers, code: u32, area: Area) {
                 dst[y * sw + x0..y * sw + x1].fill(color);
             }
         }
+        glitch if glitch >> 24 == GLITCH >> 24 => {
+            // The source must be inside the screen. Black fills the remainder.
+            let shift = (glitch & 0xFFFF) as usize * g.k;
+            let xs = x1.min(sw.saturating_sub(shift)).max(x0);
+            if xs > x0 {
+                let mut moved = *old.1;
+                moved.ox += shift;
+                upscale_screen(layers.grey, dst, &moved, (x0, y0, xs, y1));
+            }
+            let tint = TINTS[(glitch >> 16 & 3) as usize];
+            for y in y0..y1 {
+                dst[y * sw + xs..y * sw + x1].fill(BLACK);
+                if tint != WHITE {
+                    dst[y * sw + x0..y * sw + xs]
+                        .iter_mut()
+                        .for_each(|p| *p &= tint);
+                }
+            }
+        }
+        lifted if lifted >> 24 == LIFTED >> 24 => {
+            // The limit keeps the source inside the screen.
+            let shift = ((lifted & 0xFFFF) as usize * g.k).min(g.sh - y1);
+            let mut moved = *new.1;
+            moved.oy += shift;
+            upscale_screen(new.0, dst, &moved, area);
+        }
         shifted => {
             // The grid can be wider than the screen. The limit
             // keeps the source inside the image.
@@ -636,7 +608,17 @@ fn draw(dst: &mut [u32], g: &Geom, layers: &Layers, code: u32, area: Area) {
 mod tests {
     use super::*;
 
-    const KINDS: [Kind; 4] = [Kind::Burn, Kind::Sweep, Kind::Slide, Kind::Wipe];
+    const KINDS: [Kind; 9] = [
+        Kind::Burn,
+        Kind::Sweep,
+        Kind::Slide,
+        Kind::Wipe,
+        Kind::Decrypt,
+        Kind::Pour,
+        Kind::Smoke,
+        Kind::Vhstape,
+        Kind::Rain,
+    ];
 
     fn reference(px: &[u32], g: &Geom) -> Vec<u32> {
         let mut out = vec![0; g.sw * g.sh];
@@ -660,8 +642,8 @@ mod tests {
 
     #[test]
     fn gradients() {
-        assert_eq!((FIRE[0], FIRE[7]), (0xFFFF_FFFF, 0xFF51_0100));
-        assert_eq!((SMOKE[0], SMOKE[7]), (0xFF50_4F4F, 0xFFC7_C7C7));
+        assert_eq!((burn::FIRE[0], burn::FIRE[7]), (0xFFFF_FFFF, 0xFF51_0100));
+        assert_eq!((burn::SMOKE[0], burn::SMOKE[7]), (0xFF50_4F4F, 0xFFC7_C7C7));
         assert_eq!(Canvas::color(0xFFFF_FFFF).grey()[0], 0xFFFF_FFFF);
         assert_eq!(Canvas::color(0xFF00_FF00).grey()[0], 0xFF95_9595);
     }
@@ -692,7 +674,7 @@ mod tests {
 
     #[test]
     fn order_has_each_cell_one_time() {
-        let mut order = prims_order(&mut Rng(3));
+        let mut order = burn::prims_order(&mut Rng(3));
         assert_eq!(order.len(), GRID_W * GRID_H);
         order.sort_unstable();
         assert!(order.iter().enumerate().all(|(i, c)| i == *c as usize));
